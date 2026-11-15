@@ -78,6 +78,7 @@ class MainActivity : Activity() {
         root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
     }
+            info.text = "Whisper: " + try { WhisperBridge.systemInfo().take(80) } catch (e: Throwable) { "load error: " + e.message }
 
     private fun pickVideo() {
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
