@@ -6,6 +6,7 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -26,13 +27,13 @@ data class Segment(val index: Int, val startMs: Long, val endMs: Long)
 class MainActivity : Activity() {
     private val frameMs = 50
     private val maxMs = 15_000
-    private val minPauseMs = 400
     private val skipGapMs = 3_000
     private val pickCode = 1
 
     private lateinit var info: TextView
     private lateinit var list: ListView
     private lateinit var video: VideoView
+    private var player: MediaPlayer? = null
     private var segments: List<Segment> = emptyList()
     private var prepared = false
     private var startAt = 0L
@@ -46,7 +47,7 @@ class MainActivity : Activity() {
             if (pos >= startAt && pos >= stopAt) {
                 video.pause()
             } else {
-                handler.postDelayed(this, 100)
+                handler.postDelayed(this, 50)
             }
         }
     }
@@ -101,6 +102,7 @@ class MainActivity : Activity() {
     private fun loadVideo(uri: Uri) {
         handler.removeCallbacks(ticker)
         prepared = false
+        player = null
         segments = emptyList()
         list.adapter = null
         val id = ++loadId
@@ -122,9 +124,10 @@ class MainActivity : Activity() {
             r.release()
         }
 
-        video.setOnPreparedListener {
+        video.setOnPreparedListener { mp ->
+            player = mp
             prepared = true
-            video.seekTo(1)
+            mp.seekTo(1L, MediaPlayer.SEEK_CLOSEST)
         }
         video.setVideoURI(uri)
         info.text = "${fmt(dur)}  |  ${w}x${h}\nအသံကို စစ်နေပါတယ်..."
@@ -164,7 +167,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // အသံကို decode လုပ်ပြီး 50ms frame တစ်ခုချင်းရဲ့ volume (dB) ကို တွက်
     private fun analyzeAudio(uri: Uri): FloatArray {
         val ex = MediaExtractor()
         ex.setDataSource(this, uri, null)
@@ -192,7 +194,7 @@ class MainActivity : Activity() {
         val out = ArrayList<Float>()
         var sum = 0.0
         var n = 0
-        val info = MediaCodec.BufferInfo()
+        val bi = MediaCodec.BufferInfo()
         var inputDone = false
         var outputDone = false
 
@@ -211,11 +213,11 @@ class MainActivity : Activity() {
                     }
                 }
             }
-            val oi = codec.dequeueOutputBuffer(info, 10_000)
+            val oi = codec.dequeueOutputBuffer(bi, 10_000)
             if (oi >= 0) {
                 val buf = codec.getOutputBuffer(oi)!!
-                buf.position(info.offset)
-                buf.limit(info.offset + info.size)
+                buf.position(bi.offset)
+                buf.limit(bi.offset + bi.size)
                 val sb = buf.order(ByteOrder.nativeOrder()).asShortBuffer()
                 while (sb.hasRemaining()) {
                     val v = sb.get().toDouble()
@@ -229,7 +231,7 @@ class MainActivity : Activity() {
                     }
                 }
                 codec.releaseOutputBuffer(oi, false)
-                if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true
+                if ((bi.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true
             } else if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 val nf = codec.outputFormat
                 perFrame = nf.getInteger(MediaFormat.KEY_SAMPLE_RATE) *
@@ -242,6 +244,7 @@ class MainActivity : Activity() {
         return out.toFloatArray()
     }
 
+    // pause ရှည်ရာမှာ ဖြတ်: ၁၅s ထဲက "နောက်ဆုံး pause ရှည်" ကိုရွေး၊ မရှိရင် pause တို၊ မရှိရင် အသံအတိတ်ဆုံး
     private fun buildSegments(db: FloatArray, totalMs: Long): List<Segment> {
         val n = db.size
         if (n < 20) return emptyList()
@@ -249,79 +252,94 @@ class MainActivity : Activity() {
         val floor = sorted[(n * 0.2).toInt()]
         val ceil = sorted[minOf(n - 1, (n * 0.9).toInt())]
         val thr = floor + (ceil - floor) * 0.25f
-        val minPause = minPauseMs / frameMs
         val maxF = maxMs / frameMs
+        val minGap = 350 / frameMs
+        val strongGap = 700 / frameMs
         val skipF = skipGapMs / frameMs
+        val minLen = 40
 
-        // 1) စကားပြောနေတဲ့ အပိုင်းတွေ
-        val regions = ArrayList<IntArray>()
-        var start = -1
-        var last = -1
-        for (i in 0 until n) {
-            if (db[i] > thr) {
-                if (start < 0) start = i
-                last = i
-            } else if (start >= 0 && i - last >= minPause) {
-                regions.add(intArrayOf(start, last + 1))
-                start = -1
-            }
-        }
-        if (start >= 0) regions.add(intArrayOf(start, last + 1))
-
-        // 2) ၁၅ စက္ကန့်ထက် ရှည်ရင် အသံအတိတ်ဆုံးနေရာမှာ ဖြတ်
-        val pieces = ArrayList<IntArray>()
-        for (r in regions) {
-            if (r[1] - r[0] < 3) continue
-            var s = r[0]
-            while (r[1] - s > maxF) {
-                var cut = s + maxF
-                for (k in (s + maxF - 60)..(s + maxF)) {
-                    if (k > s && db[k] < db[cut]) cut = k
-                }
-                pieces.add(intArrayOf(s, cut))
-                s = cut
-            }
-            pieces.add(intArrayOf(s, r[1]))
-        }
-
-        // 3) ၁၅ စက္ကန့်မကျော်အောင် ပေါင်း၊ ၃ စက္ကန့်ကျော် gap ရှိရင် ခွဲ
-        val merged = ArrayList<IntArray>()
-        var cur: IntArray? = null
-        for (p in pieces) {
-            val c = cur
-            if (c == null) {
-                cur = intArrayOf(p[0], p[1])
-            } else if (p[0] - c[1] > skipF || p[1] - c[0] > maxF) {
-                merged.add(c)
-                cur = intArrayOf(p[0], p[1])
+        val gaps = ArrayList<IntArray>()
+        var i = 0
+        while (i < n) {
+            if (db[i] <= thr) {
+                var j = i
+                while (j < n && db[j] <= thr) j++
+                if (j - i >= minGap) gaps.add(intArrayOf(i, j))
+                i = j
             } else {
-                c[1] = p[1]
+                i++
             }
         }
-        cur?.let { merged.add(it) }
-        if (merged.isEmpty()) return emptyList()
 
-        // 4) gap သေးရင် segment တွေကို ဆက်ထား
-        for (k in 0 until merged.size - 1) {
-            if (merged[k + 1][0] - merged[k][1] <= skipF) merged[k][1] = merged[k + 1][0]
+        var s = 0
+        while (s < n && db[s] <= thr) s++
+        if (s >= n) return emptyList()
+        s = if (s <= skipF) 0 else maxOf(0, s - 4)
+
+        val cuts = ArrayList<IntArray>()
+        while (s < n) {
+            if (n - s <= maxF) {
+                cuts.add(intArrayOf(s, n))
+                break
+            }
+            val limit = s + maxF
+            var best: IntArray? = null
+            for (g in gaps) {
+                if (g[0] <= s + minLen || g[0] >= limit) continue
+                if (g[1] - g[0] >= strongGap) best = g
+            }
+            if (best == null) {
+                for (g in gaps) {
+                    if (g[0] <= s + minLen || g[0] >= limit) continue
+                    best = g
+                }
+            }
+            val end: Int
+            val next: Int
+            if (best != null) {
+                val len = best[1] - best[0]
+                if (len > skipF) {
+                    end = best[0] + 4
+                    next = best[1] - 4
+                } else {
+                    end = best[0] + len / 2
+                    next = end
+                }
+            } else {
+                var c = limit
+                for (k in (limit - 60)..limit) {
+                    if (k > s + minLen && db[k] < db[c]) c = k
+                }
+                end = c
+                next = c
+            }
+            cuts.add(intArrayOf(s, end))
+            s = next
         }
-        if (merged.first()[0] <= skipF) merged.first()[0] = 0
-        val totalF = (totalMs / frameMs).toInt()
-        if (totalF - merged.last()[1] <= skipF) merged.last()[1] = totalF
 
-        return merged.mapIndexed { i, m ->
-            Segment(i + 1, m[0].toLong() * frameMs, minOf(totalMs, m[1].toLong() * frameMs))
+        return cuts.mapIndexed { idx, c ->
+            val last = idx == cuts.lastIndex
+            Segment(
+                idx + 1,
+                c[0].toLong() * frameMs,
+                if (last) totalMs else minOf(totalMs, c[1].toLong() * frameMs)
+            )
         }
     }
 
     private fun playSegment(s: Segment) {
+        val mp = player ?: return
         if (!prepared) return
         handler.removeCallbacks(ticker)
         startAt = s.startMs
         stopAt = s.endMs
-        video.seekTo(s.startMs.toInt())
-        video.start()
-        handler.postDelayed(ticker, 300)
+        video.pause()
+        mp.setOnSeekCompleteListener {
+            mp.setOnSeekCompleteListener(null)
+            video.start()
+            handler.postDelayed(ticker, 100)
+        }
+        mp.seekTo(s.startMs, MediaPlayer.SEEK_CLOSEST)
     }
 
     override fun onDestroy() {
