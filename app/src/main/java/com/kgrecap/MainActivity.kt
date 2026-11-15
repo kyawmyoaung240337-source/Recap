@@ -1,6 +1,9 @@
 package com.kgrecap
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.media.MediaCodec
 import android.media.MediaExtractor
@@ -17,10 +20,17 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
+import android.widget.Toast
 import android.widget.VideoView
+import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.log10
-import kotlin.math.sqrt
 
 data class Segment(val index: Int, val startMs: Long, val endMs: Long)
 
@@ -30,15 +40,40 @@ class MainActivity : Activity() {
     private val skipGapMs = 3_000
     private val pickCode = 1
 
+    private val langs = listOf(
+        "zh" to "Chinese", "en" to "English", "th" to "Thai",
+        "my" to "Myanmar", "auto" to "Auto"
+    )
+    private val models = listOf(
+        Triple("base", "ggml-base-q5_1.bin", "57MB"),
+        Triple("small", "ggml-small-q5_1.bin", "181MB")
+    )
+    private var langIdx = 0
+    private var workers = 2
+    private var modelIdx = 0
+
     private lateinit var info: TextView
     private lateinit var list: ListView
     private lateinit var video: VideoView
+    private lateinit var adapter: ArrayAdapter<String>
+    private lateinit var btnLang: Button
+    private lateinit var btnWorkers: Button
+    private lateinit var btnModel: Button
+    private lateinit var btnRun: Button
+    private lateinit var btnCopy: Button
+
+    private val labels = ArrayList<String>()
     private var player: MediaPlayer? = null
     private var segments: List<Segment> = emptyList()
+    private var texts: Array<String?> = arrayOfNulls<String>(0)
+    private var pcmFile: File? = null
     private var prepared = false
     private var startAt = 0L
     private var stopAt = 0L
-    private var loadId = 0
+    @Volatile private var loadId = 0
+    @Volatile private var running = false
+    @Volatile private var stopReq = false
+    private var downloading = false
     private val handler = Handler(Looper.getMainLooper())
 
     private val ticker = object : Runnable {
@@ -52,33 +87,288 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun button(label: String, onClick: () -> Unit): Button {
+        val b = Button(this)
+        b.text = label
+        b.textSize = 12f
+        b.isAllCaps = false
+        b.setOnClickListener { onClick() }
+        return b
+    }
+
+    private fun row(vararg v: Button): LinearLayout {
+        val l = LinearLayout(this)
+        l.orientation = LinearLayout.HORIZONTAL
+        v.forEach {
+            l.addView(it, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        return l
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(32, 64, 32, 32)
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setPadding(24, 48, 24, 24)
+
+        val btnPick = button("Video ရွေးပါ") { pickVideo() }
+        btnLang = button("") {
+            langIdx = (langIdx + 1) % langs.size
+            updateButtons()
         }
-        val btn = Button(this).apply {
-            text = "Video ရွေးပါ"
-            setOnClickListener { pickVideo() }
+        btnWorkers = button("") {
+            if (!running) {
+                workers = workers % 3 + 1
+                updateButtons()
+            }
         }
-        info = TextView(this).apply {
-            textSize = 15f
-            setPadding(0, 16, 0, 16)
-            text = "Video မရွေးရသေးပါ"
+        btnModel = button("") {
+            if (!running && !downloading) {
+                modelIdx = (modelIdx + 1) % models.size
+                updateButtons()
+            }
         }
+        btnRun = button("") { onRun() }
+        btnCopy = button("Copy All (+AI)") { copyAll() }
+
+        info = TextView(this)
+        info.textSize = 14f
+        info.setPadding(0, 12, 0, 12)
+        info.text = "Video မရွေးရသေးပါ"
+
         video = VideoView(this)
         list = ListView(this)
+        adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
+        list.adapter = adapter
         list.setOnItemClickListener { _, _, pos, _ ->
             if (pos in segments.indices) playSegment(segments[pos])
         }
-        root.addView(btn)
+
+        root.addView(btnPick)
         root.addView(info)
-        root.addView(video, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 700))
+        root.addView(video, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 500))
+        root.addView(row(btnLang, btnWorkers, btnModel))
+        root.addView(row(btnRun, btnCopy))
         root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-                setContentView(root)
-        info.text = "Whisper: " + try { WhisperBridge.systemInfo().take(80) } catch (e: Throwable) { "load error: " + e.message }
+        setContentView(root)
+        updateButtons()
     }
+
+    private fun updateButtons() {
+        btnLang.text = "Lang: ${langs[langIdx].second}"
+        btnWorkers.text = "Workers: $workers"
+        btnModel.text = "Model: ${models[modelIdx].first}"
+        updateRunButton()
+    }
+
+    private fun modelFile() = File(filesDir, models[modelIdx].second)
+
+    private fun updateRunButton() {
+        btnRun.text = when {
+            downloading -> "Downloading..."
+            running && stopReq -> "ရပ်နေပါတယ်..."
+            running -> "ရပ်မယ် (Stop)"
+            !modelFile().exists() -> "Model download (${models[modelIdx].third})"
+            else -> "Transcribe စတင်မယ်"
+        }
+    }
+
+    private fun onRun() {
+        if (downloading) return
+        if (running) {
+            stopReq = true
+            updateRunButton()
+            return
+        }
+        if (!modelFile().exists()) {
+            downloadModel()
+            return
+        }
+        startTranscribe()
+    }
+
+    private fun downloadModel() {
+        downloading = true
+        updateRunButton()
+        val name = models[modelIdx].second
+        val target = modelFile()
+        Thread {
+            var err: String? = null
+            try {
+                val url = URL("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$name")
+                val c = url.openConnection() as HttpURLConnection
+                c.connectTimeout = 15000
+                c.readTimeout = 30000
+                c.instanceFollowRedirects = true
+                c.connect()
+                if (c.responseCode != 200) throw RuntimeException("HTTP ${c.responseCode}")
+                val total = c.contentLengthLong
+                val part = File(filesDir, "$name.part")
+                c.inputStream.use { ins ->
+                    FileOutputStream(part).use { os ->
+                        val buf = ByteArray(65536)
+                        var done = 0L
+                        var last = 0L
+                        while (true) {
+                            val n = ins.read(buf)
+                            if (n < 0) break
+                            os.write(buf, 0, n)
+                            done += n
+                            val now = System.currentTimeMillis()
+                            if (now - last > 500) {
+                                last = now
+                                val pct = if (total > 0) " ${done * 100 / total}%" else ""
+                                val mb = done / 1_000_000
+                                runOnUiThread { btnRun.text = "Downloading...$pct (${mb}MB)" }
+                            }
+                        }
+                    }
+                }
+                if (!part.renameTo(target)) throw RuntimeException("rename failed")
+            } catch (e: Exception) {
+                err = e.message ?: e.toString()
+            }
+            runOnUiThread {
+                downloading = false
+                updateRunButton()
+                if (err != null) {
+                    Toast.makeText(this@MainActivity, "Download error: $err", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun startTranscribe() {
+        val pcm = pcmFile
+        if (pcm == null || segments.isEmpty()) {
+            Toast.makeText(this, "Video ရွေးပြီး အသံစစ်တာ ပြီးမှ လုပ်ပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
+        running = true
+        stopReq = false
+        updateRunButton()
+        val id = loadId
+        val segs = segments
+        val tx = texts
+        val lang = langs[langIdx].first
+        val nWorkers = workers
+        val threads = maxOf(1, minOf(4, Runtime.getRuntime().availableProcessors() / nWorkers))
+        val modelPath = modelFile().absolutePath
+        val next = AtomicInteger(0)
+        val finished = AtomicInteger(0)
+
+        for (k in 0 until nWorkers) {
+            Thread {
+                var ptr = 0L
+                try {
+                    ptr = WhisperBridge.nativeInit(modelPath)
+                    if (ptr == 0L) {
+                        runOnUiThread {
+                            Toast.makeText(this@MainActivity, "Model load မရပါ", Toast.LENGTH_LONG).show()
+                        }
+                    } else {
+                        while (!stopReq && id == loadId) {
+                            val i = next.getAndIncrement()
+                            if (i >= segs.size) break
+                            if (tx[i] != null) continue
+                            val audio = readPcm(pcm, segs[i])
+                            val text = if (audio.size < 1600) ""
+                            else WhisperBridge.nativeTranscribe(ptr, audio, lang, threads).trim()
+                            runOnUiThread {
+                                if (id == loadId) {
+                                    tx[i] = text
+                                    refreshLabel(i)
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Throwable) {
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "Error: ${e.message}", Toast.LENGTH_LONG).show()
+                    }
+                } finally {
+                    if (ptr != 0L) WhisperBridge.nativeFree(ptr)
+                    if (finished.incrementAndGet() == nWorkers) {
+                        runOnUiThread {
+                            running = false
+                            stopReq = false
+                            updateRunButton()
+                        }
+                    }
+                }
+            }.start()
+        }
+    }
+
+    private fun readPcm(f: File, s: Segment): FloatArray {
+        RandomAccessFile(f, "r").use { raf ->
+            val total = raf.length() / 2
+            val a = minOf(total, s.startMs * 16)
+            val b = minOf(total, s.endMs * 16)
+            val n = (b - a).toInt()
+            if (n <= 0) return FloatArray(0)
+            val bytes = ByteArray(n * 2)
+            raf.seek(a * 2)
+            raf.readFully(bytes)
+            val sb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+            val out = FloatArray(n)
+            for (i in 0 until n) out[i] = sb.get(i) / 32768f
+            return out
+        }
+    }
+
+    private fun label(i: Int): String {
+        val s = segments[i]
+        val t = texts[i]
+        val h = "[%03d]  %s - %s  (%.1fs)".format(
+            s.index, fmt(s.startMs), fmt(s.endMs), (s.endMs - s.startMs) / 1000.0
+        )
+        return if (t == null) h else h + "\n" + (if (t.isBlank()) "(စကားမပါ)" else t)
+    }
+
+    private fun refreshLabel(i: Int) {
+        if (i < labels.size) {
+            labels[i] = label(i)
+            adapter.notifyDataSetChanged()
+        }
+    }
+
+    private fun mmss(ms: Long): String {
+        val s = ms / 1000
+        return "%02d:%02d".format(s / 60, s % 60)
+    }
+
+    private val promptText = """[INSTRUCTION FOR AI TRANSLATOR]
+Translate each numbered dialogue part below into natural spoken Myanmar (မြန်မာ).
+These are lines from a movie scene. Write them as natural character dialogue, not as a narrator. The transcript comes from speech recognition and may contain mistakes, so use the neighbouring parts to work out the real meaning.
+
+Rules:
+1. Keep every part separate. Never merge, split or move lines between parts.
+2. Keep each header line exactly as given, for example [Part 3 • 00:20 - 00:25].
+3. Under each header write only the translated spoken line, in Myanmar Unicode script. Write names and foreign words in Myanmar script too.
+4. No markdown, no speaker names, no notes, no explanations, no greetings.
+5. Separate the parts with this exact line: ----------------------------------------
+6. Return only the translated parts."""
+
+    private fun copyAll() {
+        val parts = ArrayList<String>()
+        segments.forEachIndexed { i, s ->
+            val t = texts[i]
+            if (!t.isNullOrBlank()) {
+                parts.add("[Part ${s.index} • ${mmss(s.startMs)} - ${mmss(s.endMs)}]\n$t")
+            }
+        }
+        if (parts.isEmpty()) {
+            Toast.makeText(this, "Copy ကူးစရာ စာမရှိသေးပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val text = promptText + "\n\n[INPUT TRANSCRIPT PARTS TO TRANSLATE]\n" +
+            parts.joinToString("\n----------------------------------------\n")
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("kgrecap", text))
+        Toast.makeText(this, "Copied ${parts.size} parts", Toast.LENGTH_SHORT).show()
+    }
+
     private fun pickVideo() {
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
@@ -101,10 +391,15 @@ class MainActivity : Activity() {
 
     private fun loadVideo(uri: Uri) {
         handler.removeCallbacks(ticker)
+        if (running) stopReq = true
         prepared = false
         player = null
         segments = emptyList()
-        list.adapter = null
+        texts = arrayOfNulls<String>(0)
+        pcmFile = null
+        labels.clear()
+        adapter.notifyDataSetChanged()
+        cacheDir.listFiles()?.forEach { if (it.name.startsWith("audio_")) it.delete() }
         val id = ++loadId
 
         var dur = 0L
@@ -134,30 +429,33 @@ class MainActivity : Activity() {
 
         val totalMs = dur
         val head = "${fmt(dur)}  |  ${w}x${h}"
+        val pcm = File(cacheDir, "audio_$id.pcm")
         Thread {
-            val db = try { analyzeAudio(uri) } catch (e: Exception) { FloatArray(0) }
+            var db = FloatArray(0)
+            try {
+                db = decodeAudio(uri, pcm)
+            } catch (e: Exception) { }
             val smart = buildSegments(db, totalMs)
             val usedSmart = smart.isNotEmpty()
             val result = if (usedSmart) smart else fixedSegments(totalMs)
             val mode = if (usedSmart) "စကားပြော pause အလိုက်" else "၁၃ စက္ကန့်စီ (အသံ မစစ်နိုင်)"
+            val hasPcm = db.isNotEmpty()
             runOnUiThread {
-                if (id == loadId) showSegments(result, head, mode)
+                if (id == loadId) {
+                    pcmFile = if (hasPcm) pcm else null
+                    showSegments(result, head, mode)
+                }
             }
         }.start()
     }
 
     private fun showSegments(segs: List<Segment>, head: String, mode: String) {
         segments = segs
-        info.text = "$head  |  Segments: ${segs.size}\n$mode\nSegment ကိုနှိပ်ရင် preview ကြည့်လို့ရပါတယ်"
-        list.adapter = ArrayAdapter(
-            this,
-            android.R.layout.simple_list_item_1,
-            segs.map {
-                "[%03d]  %s - %s  (%.1fs)".format(
-                    it.index, fmt(it.startMs), fmt(it.endMs), (it.endMs - it.startMs) / 1000.0
-                )
-            }
-        )
+        texts = arrayOfNulls<String>(segs.size)
+        info.text = "$head  |  Segments: ${segs.size}\n$mode"
+        labels.clear()
+        for (i in segs.indices) labels.add(label(i))
+        adapter.notifyDataSetChanged()
     }
 
     private fun fixedSegments(totalMs: Long): List<Segment> {
@@ -167,37 +465,46 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun analyzeAudio(uri: Uri): FloatArray {
+    // အသံကို decode → 16kHz mono PCM ဖိုင်ထုတ် + 50ms frame တစ်ခုချင်းရဲ့ volume (dB) ပြန်ပေး
+    private fun decodeAudio(uri: Uri, outFile: File): FloatArray {
         val ex = MediaExtractor()
         ex.setDataSource(this, uri, null)
         var track = -1
-        var fmt: MediaFormat? = null
+        var af: MediaFormat? = null
         for (i in 0 until ex.trackCount) {
             val f = ex.getTrackFormat(i)
             if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
                 track = i
-                fmt = f
+                af = f
                 break
             }
         }
-        if (track < 0 || fmt == null) {
+        if (track < 0 || af == null) {
             ex.release()
             return FloatArray(0)
         }
         ex.selectTrack(track)
-        val codec = MediaCodec.createDecoderByType(fmt.getString(MediaFormat.KEY_MIME)!!)
-        codec.configure(fmt, null, null, 0)
+        val codec = MediaCodec.createDecoderByType(af.getString(MediaFormat.KEY_MIME)!!)
+        codec.configure(af, null, null, 0)
         codec.start()
 
-        var perFrame = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE) *
-            fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT) * frameMs / 1000
-        val out = ArrayList<Float>()
-        var sum = 0.0
-        var n = 0
+        var ch = af.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+        var ratio = af.getInteger(MediaFormat.KEY_SAMPLE_RATE) / 16000.0
+        var phase = 0.0
+        var accSum = 0.0
+        var accCnt = 0
+        var chSum = 0
+        var chIdx = 0
+        var frameSum = 0.0
+        var frameN = 0
+        val db = ArrayList<Float>()
+        val os = FileOutputStream(outFile)
+        val obuf = ByteArray(1 shl 16)
+        var opos = 0
+
         val bi = MediaCodec.BufferInfo()
         var inputDone = false
         var outputDone = false
-
         while (!outputDone) {
             if (!inputDone) {
                 val ii = codec.dequeueInputBuffer(10_000)
@@ -220,31 +527,53 @@ class MainActivity : Activity() {
                 buf.limit(bi.offset + bi.size)
                 val sb = buf.order(ByteOrder.nativeOrder()).asShortBuffer()
                 while (sb.hasRemaining()) {
-                    val v = sb.get().toDouble()
-                    sum += v * v
-                    n++
-                    if (n >= perFrame) {
-                        val rms = sqrt(sum / n)
-                        out.add((20.0 * log10(maxOf(rms, 1.0) / 32768.0)).toFloat())
-                        sum = 0.0
-                        n = 0
+                    chSum += sb.get().toInt()
+                    chIdx++
+                    if (chIdx >= ch) {
+                        val m = chSum / ch
+                        chSum = 0
+                        chIdx = 0
+                        accSum += m
+                        accCnt++
+                        phase += 1.0
+                        if (phase >= ratio) {
+                            phase -= ratio
+                            val v = (accSum / accCnt).toInt().coerceIn(-32768, 32767)
+                            accSum = 0.0
+                            accCnt = 0
+                            obuf[opos++] = v.toByte()
+                            obuf[opos++] = (v shr 8).toByte()
+                            if (opos >= obuf.size) {
+                                os.write(obuf, 0, opos)
+                                opos = 0
+                            }
+                            val f = v / 32768.0
+                            frameSum += f * f
+                            frameN++
+                            if (frameN >= 800) {
+                                db.add((10.0 * log10(maxOf(frameSum / frameN, 1e-10))).toFloat())
+                                frameSum = 0.0
+                                frameN = 0
+                            }
+                        }
                     }
                 }
                 codec.releaseOutputBuffer(oi, false)
                 if ((bi.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true
             } else if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 val nf = codec.outputFormat
-                perFrame = nf.getInteger(MediaFormat.KEY_SAMPLE_RATE) *
-                    nf.getInteger(MediaFormat.KEY_CHANNEL_COUNT) * frameMs / 1000
+                ch = nf.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                ratio = nf.getInteger(MediaFormat.KEY_SAMPLE_RATE) / 16000.0
             }
         }
+        if (opos > 0) os.write(obuf, 0, opos)
+        os.close()
         codec.stop()
         codec.release()
         ex.release()
-        return out.toFloatArray()
+        return db.toFloatArray()
     }
 
-    // pause ရှည်ရာမှာ ဖြတ်: ၁၅s ထဲက "နောက်ဆုံး pause ရှည်" ကိုရွေး၊ မရှိရင် pause တို၊ မရှိရင် အသံအတိတ်ဆုံး
     private fun buildSegments(db: FloatArray, totalMs: Long): List<Segment> {
         val n = db.size
         if (n < 20) return emptyList()
@@ -344,6 +673,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         handler.removeCallbacks(ticker)
+        stopReq = true
         super.onDestroy()
     }
 
