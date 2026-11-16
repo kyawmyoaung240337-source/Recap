@@ -6,6 +6,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -15,15 +16,15 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
+import android.view.Gravity
 import android.view.ViewGroup
+import android.widget.AbsListView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ListView
-import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -33,6 +34,7 @@ import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
@@ -48,6 +50,7 @@ class MainActivity : Activity() {
     private val pickCode = 1
     private val maxAudioSpeed = 1.2
     private val maxVideoSpeed = 1.3
+    private val videoHeightRatio = 0.36
 
     private val langs = listOf(
         "zh" to "Chinese", "en" to "English", "th" to "Thai",
@@ -62,12 +65,8 @@ class MainActivity : Activity() {
     private var modelIdx = 0
     private var toEnglish = false
 
-    private lateinit var info: TextView
-    private lateinit var status: TextView
-    private lateinit var bar: ProgressBar
     private lateinit var list: ListView
     private lateinit var video: VideoView
-    private lateinit var videoLp: LinearLayout.LayoutParams
     private lateinit var adapter: ArrayAdapter<String>
     private lateinit var btnLang: Button
     private lateinit var btnWorkers: Button
@@ -78,10 +77,6 @@ class MainActivity : Activity() {
     private lateinit var btnPaste: Button
     private lateinit var btnTts: Button
 
-    private var smallH = 600
-    private var bigH = 1200
-    private var bigPreview = false
-
     private val labels = ArrayList<String>()
     private var player: MediaPlayer? = null
     private var segments: List<Segment> = emptyList()
@@ -90,6 +85,7 @@ class MainActivity : Activity() {
     private var ttsMs: LongArray = LongArray(0)
     private var pcmFile: File? = null
     private var prepared = false
+    private var analyzing = false
     private var startAt = 0L
     private var stopAt = 0L
     @Volatile private var loadId = 0
@@ -98,12 +94,8 @@ class MainActivity : Activity() {
     private var downloading = false
     private val handler = Handler(Looper.getMainLooper())
 
-    private var tts: TextToSpeech? = null
-    private var ttsReady = false
-    private var ttsRunning = false
-    private var ttsStop = false
-    private var ttsQueue: List<Int> = emptyList()
-    private var ttsPos = 0
+    @Volatile private var ttsRunning = false
+    @Volatile private var ttsStop = false
     private var ttsPlayer: MediaPlayer? = null
 
     private val ticker = object : Runnable {
@@ -137,13 +129,26 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        actionBar?.hide()
         val dm = resources.displayMetrics
-        smallH = (dm.heightPixels * 0.34).toInt()
-        bigH = (dm.heightPixels * 0.62).toInt()
+        val videoH = (dm.heightPixels * videoHeightRatio).toInt()
 
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
-        root.setPadding(24, 40, 24, 16)
+
+        // Video: အပေါ်ဆုံးမှာ ကပ်ထား၊ အလယ်တည့်တည့်
+        video = VideoView(this)
+        val box = FrameLayout(this)
+        box.setBackgroundColor(Color.BLACK)
+        box.addView(
+            video,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER
+            )
+        )
+        root.addView(box, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, videoH))
 
         val btnPick = button("Video ရွေးပါ") { pickVideo() }
         btnLang = button("") {
@@ -177,92 +182,101 @@ class MainActivity : Activity() {
         }
         btnRun = button("") { onRun() }
         btnCopy = button("Copy All (+AI)") { copyAll() }
-        btnPaste = button("Paste All") { pasteAll() }
+        btnPaste = button("") { pasteAll() }
         btnTts = button("") { onTts() }
 
-        info = TextView(this)
-        info.textSize = 13f
-        info.setPadding(0, 8, 0, 8)
-        info.text = "Video မရွေးရသေးပါ"
-
-        status = TextView(this)
-        status.textSize = 13f
-        status.setPadding(0, 8, 0, 4)
-        bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
-
-        video = VideoView(this)
-        videoLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, smallH)
-        video.setOnClickListener {
-            bigPreview = !bigPreview
-            videoLp.height = if (bigPreview) bigH else smallH
-            video.layoutParams = videoLp
-        }
+        // ခလုတ်တွေကို စာရင်းရဲ့ header အဖြစ်ထည့် → အောက်ဆွဲရင် အတူပါသွား
+        val header = LinearLayout(this)
+        header.orientation = LinearLayout.VERTICAL
+        header.setPadding(16, 12, 16, 8)
+        header.layoutParams = AbsListView.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        header.addView(btnPick)
+        header.addView(row(btnLang, btnWorkers, btnModel))
+        header.addView(row(btnOut, btnRun))
+        header.addView(row(btnCopy, btnPaste, btnTts))
 
         list = ListView(this)
+        list.addHeaderView(header, null, false)
         adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
         list.adapter = adapter
         list.setOnItemClickListener { _, _, pos, _ ->
-            if (pos in segments.indices) playSegment(segments[pos])
+            val p = pos - list.headerViewsCount
+            if (p in segments.indices) playSegment(segments[p])
         }
         list.setOnItemLongClickListener { _, _, pos, _ ->
-            if (pos in segments.indices) editSegment(pos)
+            val p = pos - list.headerViewsCount
+            if (p in segments.indices) editSegment(p)
             true
         }
-
-        root.addView(btnPick)
-        root.addView(info)
-        root.addView(video, videoLp)
-        root.addView(row(btnLang, btnWorkers, btnModel))
-        root.addView(row(btnOut, btnRun))
-        root.addView(row(btnCopy, btnPaste, btnTts))
-        root.addView(status)
-        root.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 24))
         root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
         setContentView(root)
         updateButtons()
-        updateStatus()
     }
+
+    // ---------------- ခလုတ်ပေါ်က progress ----------------
+
+    private fun nDone() = texts.count { it != null }
+    private fun nSpeech() = texts.count { !it.isNullOrBlank() }
+    private fun nTrans() = texts.indices.count { !texts[it].isNullOrBlank() && !trans[it].isNullOrBlank() }
+    private fun nTts() = ttsMs.count { it > 0L }
 
     private fun updateButtons() {
         btnLang.text = "Lang: ${langs[langIdx].second}"
         btnWorkers.text = "Workers: $workers"
         btnModel.text = "Model: ${models[modelIdx].first}"
         btnOut.text = if (toEnglish) "Output: English" else "Output: Original"
-        btnTts.text = if (ttsRunning) "TTS ရပ်မယ်" else "TTS ထုတ်မယ်"
-        updateRunButton()
+        updateProgress()
     }
 
-    private fun updateStatus() {
-        val n = texts.size
-        if (n == 0) {
-            status.text = "စာထုတ်ဖို့ Video ရွေးပါ"
-            bar.max = 1
-            bar.progress = 0
-            return
-        }
-        val done = texts.count { it != null }
-        val speech = texts.count { !it.isNullOrBlank() }
-        val tr = (0 until n).count { !texts[it].isNullOrBlank() && !trans[it].isNullOrBlank() }
-        val tt = ttsMs.count { it > 0L }
-        status.text = "စာထုတ် $done/$n (ကျန် ${n - done})  •  ဘာသာပြန် $tr/$speech  •  အသံ $tt/$speech"
-        bar.max = n
-        bar.progress = done
+    private fun updateProgress() {
+        updateRunButton()
+        updatePasteButton()
+        updateTtsButton()
     }
 
     private fun modelFile() = File(filesDir, models[modelIdx].second)
 
     private fun updateRunButton() {
+        val n = texts.size
+        val d = nDone()
         btnRun.text = when {
             downloading -> "Downloading..."
-            running && stopReq -> "ရပ်နေပါတယ်..."
-            running -> "ရပ်မယ် (Stop)"
+            analyzing -> "အသံစစ်နေပါတယ်..."
+            running && stopReq -> "ရပ်နေပါတယ်... $d/$n"
+            running -> "စာထုတ်နေ $d/$n (ကျန် ${n - d}) • ရပ်မယ်"
             !modelFile().exists() -> "Model download (${models[modelIdx].third})"
-            else -> "Transcribe စတင်မယ်"
+            n == 0 -> "Transcribe (Video ရွေးပါ)"
+            d == 0 -> "Transcribe စတင်မယ်"
+            d < n -> "ဆက်လုပ်မယ် $d/$n (ကျန် ${n - d})"
+            else -> "စာထုတ်ပြီး $d/$n ✓"
         }
     }
 
+    private fun updatePasteButton() {
+        val t = nTrans()
+        val sp = nSpeech()
+        btnPaste.text = if (t == 0) "Paste All"
+        else "Paste All\nဘာသာပြန် $t/$sp" + (if (t >= sp) " ✓" else "")
+    }
+
+    private fun updateTtsButton() {
+        val t = nTts()
+        val tr = nTrans()
+        btnTts.text = when {
+            ttsRunning && ttsStop -> "ရပ်နေပါတယ်..."
+            ttsRunning -> "အသံထုတ်နေ $t/$tr • ရပ်မယ်"
+            t == 0 -> "TTS ထုတ်မယ်"
+            else -> "TTS ထုတ်မယ်\nအသံ $t/$tr" + (if (t >= tr) " ✓" else "")
+        }
+    }
+
+    // ---------------- Whisper ----------------
+
     private fun onRun() {
-        if (downloading) return
+        if (downloading || analyzing) return
         if (running) {
             stopReq = true
             updateRunButton()
@@ -406,6 +420,8 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------------- စာရင်း label ----------------
+
     private fun plan(i: Int): String {
         val c = (segments[i].endMs - segments[i].startMs) / 1000.0
         val t = ttsMs[i] / 1000.0
@@ -441,13 +457,13 @@ class MainActivity : Activity() {
             labels[i] = label(i)
             adapter.notifyDataSetChanged()
         }
-        updateStatus()
+        updateProgress()
     }
 
     private fun refreshAll() {
         for (i in labels.indices) labels[i] = label(i)
         adapter.notifyDataSetChanged()
-        updateStatus()
+        updateProgress()
     }
 
     private fun clearTexts() {
@@ -463,6 +479,8 @@ class MainActivity : Activity() {
         val s = ms / 1000
         return "%02d:%02d".format(s / 60, s % 60)
     }
+
+    // ---------------- Copy / Paste ----------------
 
     private fun buildPrompt(): String {
         val src = if (toEnglish)
@@ -533,7 +551,6 @@ Timing rules (very important):
             ).show()
             return
         }
-        var ok = 0
         ms.forEachIndexed { k, m ->
             val no = m.groupValues[1].toInt()
             val end = if (k + 1 < ms.size) ms[k + 1].range.first else raw.length
@@ -543,18 +560,17 @@ Timing rules (very important):
                 .trim('*', ' ', '\n')
             val idx = segments.indexOfFirst { it.index == no }
             if (idx >= 0 && body.isNotEmpty()) {
+                if (body != trans[idx]) ttsMs[idx] = 0L
                 trans[idx] = body
-                ttsMs[idx] = 0L
-                ok++
             }
         }
         refreshAll()
         val missing = segments.indices
             .filter { !texts[it].isNullOrBlank() && trans[it].isNullOrBlank() }
             .map { segments[it].index }
-        var msg = "Paste ပြီး: $ok parts"
-        if (missing.isNotEmpty()) msg += "\nမပါသေးတာ: " + missing.joinToString(", ")
-        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+        if (missing.isNotEmpty()) {
+            Toast.makeText(this, "မပါသေးတာ: " + missing.joinToString(", "), Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun editSegment(i: Int) {
@@ -593,9 +609,9 @@ Timing rules (very important):
             .show()
     }
 
-    // ---------------- TTS ----------------
+    // ---------------- TTS (online) ----------------
 
-    private fun ttsFile(i: Int) = File(cacheDir, "tts_${segments[i].index}.wav")
+    private fun ttsFile(i: Int) = File(cacheDir, "tts_${segments[i].index}.mp3")
 
     private fun playTts(i: Int) {
         if (i >= ttsMs.size || ttsMs[i] <= 0L) {
@@ -620,119 +636,110 @@ Timing rules (very important):
     private fun onTts() {
         if (ttsRunning) {
             ttsStop = true
-            tts?.stop()
+            updateTtsButton()
             return
         }
         if (segments.isEmpty()) return
-        val todo = segments.indices.filter { !trans[it].isNullOrBlank() }
-        if (todo.isEmpty()) {
+        val all = segments.indices.filter { !trans[it].isNullOrBlank() }
+        if (all.isEmpty()) {
             Toast.makeText(this, "မြန်မာ ဘာသာပြန် မရှိသေးပါ (Paste All အရင်လုပ်ပါ)", Toast.LENGTH_LONG).show()
             return
         }
-        ensureTts { ok ->
-            if (ok) {
-                ttsQueue = todo
-                ttsPos = 0
+        val todo = all.filter { ttsMs[it] <= 0L }
+        if (todo.isEmpty()) {
+            Toast.makeText(
+                this, "အသံ အကုန်ပြီးပြီ။ ပြန်ထုတ်ချင်တဲ့အပိုင်းကို ကြာကြာနှိပ်ပြီး Save လုပ်ပါ",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        ttsRunning = true
+        ttsStop = false
+        updateTtsButton()
+        val id = loadId
+        val tr = trans
+        Thread {
+            var err: String? = null
+            for (i in todo) {
+                if (ttsStop || id != loadId) break
+                val text = tr[i] ?: continue
+                try {
+                    val f = ttsFile(i)
+                    onlineSynth(text, f)
+                    val d = durationOf(f)
+                    if (d <= 0L) throw RuntimeException("အသံဖိုင် မမှန်ပါ")
+                    runOnUiThread {
+                        if (id == loadId) {
+                            ttsMs[i] = d
+                            refreshLabel(i)
+                        }
+                    }
+                } catch (e: Exception) {
+                    err = e.message ?: e.toString()
+                    break
+                }
+            }
+            runOnUiThread {
+                ttsRunning = false
                 ttsStop = false
-                ttsRunning = true
-                updateButtons()
-                ttsNext()
-            }
-        }
-    }
-
-    private fun ensureTts(cb: (Boolean) -> Unit) {
-        if (ttsReady && tts != null) {
-            cb(true)
-            return
-        }
-        Toast.makeText(this, "TTS စစ်နေပါတယ်...", Toast.LENGTH_SHORT).show()
-        tts?.shutdown()
-        tts = null
-        ttsReady = false
-        tts = TextToSpeech(this, TextToSpeech.OnInitListener { st ->
-            handler.post {
-                val t = tts
-                if (st != TextToSpeech.SUCCESS || t == null) {
-                    showTtsHelp("TTS engine မစနိုင်ပါ။ ဖုန်းမှာ TTS engine မရှိ ဒါမှမဟုတ် ပိတ်ထားနိုင်ပါတယ်။")
-                    cb(false)
-                } else {
-                    var r = t.setLanguage(Locale("my", "MM"))
-                    if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
-                        r = t.setLanguage(Locale("my"))
-                    }
-                    if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
-                        showTtsHelp("ဒီဖုန်းမှာ မြန်မာ TTS voice မတွေ့ပါ။")
-                        cb(false)
-                    } else {
-                        t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                            override fun onStart(utteranceId: String?) {}
-                            override fun onDone(utteranceId: String?) {
-                                onTtsDone(utteranceId, true)
-                            }
-                            override fun onError(utteranceId: String?) {
-                                onTtsDone(utteranceId, false)
-                            }
-                        })
-                        ttsReady = true
-                        cb(true)
-                    }
+                updateTtsButton()
+                if (err != null) {
+                    Toast.makeText(this@MainActivity, "TTS error: $err", Toast.LENGTH_LONG).show()
                 }
             }
-        })
+        }.start()
     }
 
-    private fun showTtsHelp(msg: String) {
-        AlertDialog.Builder(this)
-            .setTitle("မြန်မာ TTS")
-            .setMessage(
-                msg + "\n\nစစ်ကြည့်ရန်:\nSettings → Additional settings (သို့) System → Language → " +
-                    "Text-to-speech output။ Engine က Google Speech Services ဖြစ်ရမယ်။ " +
-                    "⚙ ကိုနှိပ် → Install voice data မှာ Myanmar ရှိမရှိ ကြည့်ပါ။\n\n" +
-                    "မရှိရင် ကျွန်တော့်ကို ပြောပါ၊ တခြားနည်း ရှာပေးမယ်။"
-            )
-            .setPositiveButton("OK", null)
-            .show()
-    }
-
-    private fun ttsNext() {
-        val t = tts
-        if (ttsStop || t == null || ttsPos >= ttsQueue.size) {
-            ttsRunning = false
-            updateButtons()
-            updateStatus()
-            return
-        }
-        val i = ttsQueue[ttsPos]
-        val text = trans[i] ?: ""
-        val r = t.synthesizeToFile(text, Bundle(), ttsFile(i), "p$i")
-        if (r != TextToSpeech.SUCCESS) {
-            ttsPos++
-            ttsNext()
-        }
-    }
-
-    private fun onTtsDone(uid: String?, ok: Boolean) {
-        handler.post {
-            val i = uid?.removePrefix("p")?.toIntOrNull()
-            if (i != null && ok && i < segments.size) {
-                val f = ttsFile(i)
-                if (f.exists()) {
-                    val mr = MediaMetadataRetriever()
-                    try {
-                        mr.setDataSource(f.absolutePath)
-                        val d = mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                            ?.toLongOrNull() ?: 0L
-                        ttsMs[i] = d
-                        refreshLabel(i)
-                    } catch (e: Exception) {
-                    } finally {
-                        mr.release()
-                    }
-                }
+    private fun onlineSynth(text: String, out: File) {
+        val chunks = splitText(text, 120)
+        if (chunks.isEmpty()) throw RuntimeException("စာမရှိပါ")
+        FileOutputStream(out).use { os ->
+            for (c in chunks) {
+                val q = URLEncoder.encode(c, "UTF-8")
+                val url = URL("https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=my&q=$q")
+                val con = url.openConnection() as HttpURLConnection
+                con.setRequestProperty(
+                    "User-Agent",
+                    "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36"
+                )
+                con.connectTimeout = 15000
+                con.readTimeout = 30000
+                if (con.responseCode != 200) throw RuntimeException("TTS HTTP ${con.responseCode}")
+                con.inputStream.use { it.copyTo(os) }
             }
-            ttsPos++
-            ttsNext()
+        }
+    }
+
+    private fun splitText(t: String, max: Int): List<String> {
+        val out = ArrayList<String>()
+        var cur = StringBuilder()
+        fun flush() {
+            val s = cur.toString().trim()
+            if (s.isNotEmpty()) out.add(s)
+            cur = StringBuilder()
+        }
+        for (ch in t) {
+            if (ch == '\n') {
+                flush()
+                continue
+            }
+            cur.append(ch)
+            val p = ch == '။' || ch == '၊' || ch == '.' || ch == '!' || ch == '?'
+            if (p || cur.length >= max || (ch == ' ' && cur.length >= max * 7 / 10)) flush()
+        }
+        flush()
+        return out
+    }
+
+    private fun durationOf(f: File): Long {
+        val mr = MediaMetadataRetriever()
+        return try {
+            mr.setDataSource(f.absolutePath)
+            mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        } catch (e: Exception) {
+            0L
+        } finally {
+            mr.release()
         }
     }
 
@@ -761,10 +768,7 @@ Timing rules (very important):
     private fun loadVideo(uri: Uri) {
         handler.removeCallbacks(ticker)
         if (running) stopReq = true
-        if (ttsRunning) {
-            ttsStop = true
-            tts?.stop()
-        }
+        if (ttsRunning) ttsStop = true
         prepared = false
         player = null
         segments = emptyList()
@@ -777,7 +781,6 @@ Timing rules (very important):
         cacheDir.listFiles()?.forEach {
             if (it.name.startsWith("audio_") || it.name.startsWith("tts_")) it.delete()
         }
-        updateStatus()
         val id = ++loadId
 
         var dur = 0L
@@ -791,7 +794,8 @@ Timing rules (very important):
             w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
             h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
         } catch (e: Exception) {
-            info.text = "Error: ${e.message}"
+            Toast.makeText(this, "Error: ${e.message}", Toast.LENGTH_LONG).show()
+            updateProgress()
             return
         } finally {
             r.release()
@@ -803,10 +807,11 @@ Timing rules (very important):
             mp.seekTo(1L, MediaPlayer.SEEK_CLOSEST)
         }
         video.setVideoURI(uri)
-        info.text = "${fmt(dur)}  |  ${w}x${h}\nအသံကို စစ်နေပါတယ်..."
+        analyzing = true
+        updateProgress()
 
         val totalMs = dur
-        val head = "${fmt(dur)}  |  ${w}x${h}"
+        val head = "${fmt(dur)} | ${w}x${h}"
         val pcm = File(cacheDir, "audio_$id.pcm")
         Thread {
             var db = FloatArray(0)
@@ -816,7 +821,7 @@ Timing rules (very important):
             val smart = buildSegments(db, totalMs)
             val usedSmart = smart.isNotEmpty()
             val result = if (usedSmart) smart else fixedSegments(totalMs)
-            val mode = if (usedSmart) "စကားပြော pause အလိုက်" else "၁၃ စက္ကန့်စီ (အသံ မစစ်နိုင်)"
+            val mode = if (usedSmart) "pause အလိုက်" else "၁၃ စက္ကန့်စီ"
             val hasPcm = db.isNotEmpty()
             runOnUiThread {
                 if (id == loadId) {
@@ -828,15 +833,19 @@ Timing rules (very important):
     }
 
     private fun showSegments(segs: List<Segment>, head: String, mode: String) {
+        analyzing = false
         segments = segs
         texts = arrayOfNulls<String>(segs.size)
         trans = arrayOfNulls<String>(segs.size)
         ttsMs = LongArray(segs.size)
-        info.text = "$head  |  Segments: ${segs.size}\n$mode • Preview ကိုနှိပ်ရင် ကြီး/သေး • စာကို ကြာကြာနှိပ်ရင် ပြင်"
         labels.clear()
         for (i in segs.indices) labels.add(label(i))
         adapter.notifyDataSetChanged()
-        updateStatus()
+        updateProgress()
+        Toast.makeText(
+            this, "$head | Segments: ${segs.size} | $mode\n(စာကို ကြာကြာနှိပ်ရင် ပြင်လို့ရ)",
+            Toast.LENGTH_LONG
+        ).show()
     }
 
     private fun fixedSegments(totalMs: Long): List<Segment> {
@@ -1055,7 +1064,6 @@ Timing rules (very important):
         handler.removeCallbacks(ticker)
         stopReq = true
         ttsStop = true
-        tts?.shutdown()
         ttsPlayer?.release()
         super.onDestroy()
     }
