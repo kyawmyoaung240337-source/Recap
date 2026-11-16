@@ -15,12 +15,15 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -32,6 +35,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.log10
 
@@ -42,6 +46,8 @@ class MainActivity : Activity() {
     private val maxMs = 15_000
     private val skipGapMs = 3_000
     private val pickCode = 1
+    private val maxAudioSpeed = 1.2
+    private val maxVideoSpeed = 1.3
 
     private val langs = listOf(
         "zh" to "Chinese", "en" to "English", "th" to "Thai",
@@ -54,11 +60,14 @@ class MainActivity : Activity() {
     private var langIdx = 0
     private var workers = 2
     private var modelIdx = 0
-    private var toEnglish = true
+    private var toEnglish = false
 
     private lateinit var info: TextView
+    private lateinit var status: TextView
+    private lateinit var bar: ProgressBar
     private lateinit var list: ListView
     private lateinit var video: VideoView
+    private lateinit var videoLp: LinearLayout.LayoutParams
     private lateinit var adapter: ArrayAdapter<String>
     private lateinit var btnLang: Button
     private lateinit var btnWorkers: Button
@@ -67,12 +76,18 @@ class MainActivity : Activity() {
     private lateinit var btnRun: Button
     private lateinit var btnCopy: Button
     private lateinit var btnPaste: Button
+    private lateinit var btnTts: Button
+
+    private var smallH = 600
+    private var bigH = 1200
+    private var bigPreview = false
 
     private val labels = ArrayList<String>()
     private var player: MediaPlayer? = null
     private var segments: List<Segment> = emptyList()
     private var texts: Array<String?> = arrayOfNulls<String>(0)
     private var trans: Array<String?> = arrayOfNulls<String>(0)
+    private var ttsMs: LongArray = LongArray(0)
     private var pcmFile: File? = null
     private var prepared = false
     private var startAt = 0L
@@ -82,6 +97,14 @@ class MainActivity : Activity() {
     @Volatile private var stopReq = false
     private var downloading = false
     private val handler = Handler(Looper.getMainLooper())
+
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private var ttsRunning = false
+    private var ttsStop = false
+    private var ttsQueue: List<Int> = emptyList()
+    private var ttsPos = 0
+    private var ttsPlayer: MediaPlayer? = null
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -114,9 +137,13 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val dm = resources.displayMetrics
+        smallH = (dm.heightPixels * 0.34).toInt()
+        bigH = (dm.heightPixels * 0.62).toInt()
+
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
-        root.setPadding(24, 48, 24, 24)
+        root.setPadding(24, 40, 24, 16)
 
         val btnPick = button("Video ရွေးပါ") { pickVideo() }
         btnLang = button("") {
@@ -151,13 +178,26 @@ class MainActivity : Activity() {
         btnRun = button("") { onRun() }
         btnCopy = button("Copy All (+AI)") { copyAll() }
         btnPaste = button("Paste All") { pasteAll() }
+        btnTts = button("") { onTts() }
 
         info = TextView(this)
-        info.textSize = 14f
-        info.setPadding(0, 12, 0, 12)
+        info.textSize = 13f
+        info.setPadding(0, 8, 0, 8)
         info.text = "Video မရွေးရသေးပါ"
 
+        status = TextView(this)
+        status.textSize = 13f
+        status.setPadding(0, 8, 0, 4)
+        bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+
         video = VideoView(this)
+        videoLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, smallH)
+        video.setOnClickListener {
+            bigPreview = !bigPreview
+            videoLp.height = if (bigPreview) bigH else smallH
+            video.layoutParams = videoLp
+        }
+
         list = ListView(this)
         adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
         list.adapter = adapter
@@ -171,13 +211,16 @@ class MainActivity : Activity() {
 
         root.addView(btnPick)
         root.addView(info)
-        root.addView(video, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 450))
+        root.addView(video, videoLp)
         root.addView(row(btnLang, btnWorkers, btnModel))
         root.addView(row(btnOut, btnRun))
-        root.addView(row(btnCopy, btnPaste))
+        root.addView(row(btnCopy, btnPaste, btnTts))
+        root.addView(status)
+        root.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 24))
         root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
         updateButtons()
+        updateStatus()
     }
 
     private fun updateButtons() {
@@ -185,7 +228,25 @@ class MainActivity : Activity() {
         btnWorkers.text = "Workers: $workers"
         btnModel.text = "Model: ${models[modelIdx].first}"
         btnOut.text = if (toEnglish) "Output: English" else "Output: Original"
+        btnTts.text = if (ttsRunning) "TTS ရပ်မယ်" else "TTS ထုတ်မယ်"
         updateRunButton()
+    }
+
+    private fun updateStatus() {
+        val n = texts.size
+        if (n == 0) {
+            status.text = "စာထုတ်ဖို့ Video ရွေးပါ"
+            bar.max = 1
+            bar.progress = 0
+            return
+        }
+        val done = texts.count { it != null }
+        val speech = texts.count { !it.isNullOrBlank() }
+        val tr = (0 until n).count { !texts[it].isNullOrBlank() && !trans[it].isNullOrBlank() }
+        val tt = ttsMs.count { it > 0L }
+        status.text = "စာထုတ် $done/$n (ကျန် ${n - done})  •  ဘာသာပြန် $tr/$speech  •  အသံ $tt/$speech"
+        bar.max = n
+        bar.progress = done
     }
 
     private fun modelFile() = File(filesDir, models[modelIdx].second)
@@ -345,6 +406,23 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun plan(i: Int): String {
+        val c = (segments[i].endMs - segments[i].startMs) / 1000.0
+        val t = ttsMs[i] / 1000.0
+        var aSp = 1.0
+        var vSp = 1.0
+        var flag = ""
+        if (t > c) {
+            aSp = minOf(t / c, maxAudioSpeed)
+            if (t / aSp > c + 0.05) flag = "  ⚠ စာရှည်နေသေး (တိုပါ)"
+        } else if (t < c) {
+            vSp = minOf(c / t, maxVideoSpeed)
+        }
+        return String.format(
+            Locale.US, "🔊 %.1fs | clip %.1fs | အသံ %.2fx | video %.2fx%s", t, c, aSp, vSp, flag
+        )
+    }
+
     private fun label(i: Int): String {
         val s = segments[i]
         val t = texts[i]
@@ -354,6 +432,7 @@ class MainActivity : Activity() {
         )
         if (t != null) r += "\n" + (if (t.isBlank()) "(စကားမပါ)" else t)
         if (!tr.isNullOrBlank()) r += "\n➜ " + tr
+        if (i < ttsMs.size && ttsMs[i] > 0L) r += "\n" + plan(i)
         return r
     }
 
@@ -362,11 +441,13 @@ class MainActivity : Activity() {
             labels[i] = label(i)
             adapter.notifyDataSetChanged()
         }
+        updateStatus()
     }
 
     private fun refreshAll() {
         for (i in labels.indices) labels[i] = label(i)
         adapter.notifyDataSetChanged()
+        updateStatus()
     }
 
     private fun clearTexts() {
@@ -374,6 +455,7 @@ class MainActivity : Activity() {
             texts[i] = null
             trans[i] = null
         }
+        for (i in ttsMs.indices) ttsMs[i] = 0L
         refreshAll()
     }
 
@@ -382,45 +464,50 @@ class MainActivity : Activity() {
         return "%02d:%02d".format(s / 60, s % 60)
     }
 
-    private val promptEnglish = """[INSTRUCTION FOR AI TRANSLATOR]
-Translate each numbered dialogue part below from English into natural spoken Myanmar (မြန်မာ).
-These lines come from a Chinese drama. The English was produced by speech recognition and machine translation, so it may contain mistakes. Use the neighbouring parts to work out the real meaning.
-Write the lines as natural character dialogue, not as a narrator.
+    private fun buildPrompt(): String {
+        val src = if (toEnglish)
+            "English (machine-translated from a drama, so it may contain mistakes)"
+        else
+            "the original spoken language (speech recognition output, so it may contain mistakes)"
+        return """[INSTRUCTION FOR AI TRANSLATOR]
+Translate each numbered dialogue part below from $src into natural spoken Myanmar (မြန်မာ).
+These lines come from a drama scene. Write them as natural character dialogue, not as a narrator. Use the neighbouring parts to work out the real meaning when the text looks wrong.
+The lines will be read aloud by a voice-over, so timing matters.
 
 Rules:
 1. Keep every part separate. Never merge, split or move lines between parts.
-2. Keep each [Part N • start - end] header line exactly as given.
+2. Keep each header line exactly as given, including the times and the limit, for example [Part 3 • 00:20 - 00:25 • 5.0s • max 22 syllables].
 3. Under each header write only the translated spoken line, in Myanmar Unicode script. Write names and foreign words in Myanmar script too.
 4. No markdown, no speaker names, no notes, no explanations, no greetings.
 5. Separate the parts with this exact line: ----------------------------------------
-6. Return only the translated parts."""
+6. Return only the translated parts.
 
-    private val promptOriginal = """[INSTRUCTION FOR AI TRANSLATOR]
-Translate each numbered dialogue part below into natural spoken Myanmar (မြန်မာ).
-These are lines from a movie scene. Write them as natural character dialogue, not as a narrator. The transcript comes from speech recognition and may contain mistakes, so use the neighbouring parts to work out the real meaning.
-
-Rules:
-1. Keep every part separate. Never merge, split or move lines between parts.
-2. Keep each [Part N • start - end] header line exactly as given.
-3. Under each header write only the translated spoken line, in Myanmar Unicode script. Write names and foreign words in Myanmar script too.
-4. No markdown, no speaker names, no notes, no explanations, no greetings.
-5. Separate the parts with this exact line: ----------------------------------------
-6. Return only the translated parts."""
+Timing rules (very important):
+7. Each header shows the clip length in seconds and a syllable limit.
+8. The Myanmar line must be speakable at normal speed within that clip length. Stay at or under the syllable limit.
+9. If the full translation is too long, shorten it. Keep the same meaning. Drop filler words and repeated phrases, but never change the facts, names or the emotion.
+10. A line shorter than the limit is fine."""
+    }
 
     private fun copyAll() {
         val parts = ArrayList<String>()
         segments.forEachIndexed { i, s ->
             val t = texts[i]
             if (!t.isNullOrBlank()) {
-                parts.add("[Part ${s.index} • ${mmss(s.startMs)} - ${mmss(s.endMs)}]\n$t")
+                val sec = (s.endMs - s.startMs) / 1000.0
+                val maxSyl = maxOf(3, Math.round(sec * 4.5).toInt())
+                val head = String.format(
+                    Locale.US, "[Part %d • %s - %s • %.1fs • max %d syllables]",
+                    s.index, mmss(s.startMs), mmss(s.endMs), sec, maxSyl
+                )
+                parts.add("$head\n$t")
             }
         }
         if (parts.isEmpty()) {
             Toast.makeText(this, "Copy ကူးစရာ စာမရှိသေးပါ", Toast.LENGTH_SHORT).show()
             return
         }
-        val prompt = if (toEnglish) promptEnglish else promptOriginal
-        val text = prompt + "\n\n[INPUT TRANSCRIPT PARTS TO TRANSLATE]\n" +
+        val text = buildPrompt() + "\n\n[INPUT TRANSCRIPT PARTS TO TRANSLATE]\n" +
             parts.joinToString("\n----------------------------------------\n")
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText("kgrecap", text))
@@ -440,7 +527,10 @@ Rules:
             clip.getItemAt(0).coerceToText(this).toString() else ""
         val ms = partRe.findAll(raw).toList()
         if (ms.isEmpty()) {
-            Toast.makeText(this, "[Part 1 • ...] ပုံစံ မတွေ့ပါ။ Gemini ရလဒ်ကို Copy အရင်လုပ်ပါ", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this, "[Part 1 • ...] ပုံစံ မတွေ့ပါ။ Gemini ရလဒ်ကို Copy အရင်လုပ်ပါ",
+                Toast.LENGTH_LONG
+            ).show()
             return
         }
         var ok = 0
@@ -454,6 +544,7 @@ Rules:
             val idx = segments.indexOfFirst { it.index == no }
             if (idx >= 0 && body.isNotEmpty()) {
                 trans[idx] = body
+                ttsMs[idx] = 0L
                 ok++
             }
         }
@@ -492,12 +583,160 @@ Rules:
             .setPositiveButton("Save") { _, _ ->
                 texts[i] = e1.text.toString().trim()
                 val t = e2.text.toString().trim()
-                trans[i] = if (t.isEmpty()) null else t
+                val newTr = if (t.isEmpty()) null else t
+                if (newTr != trans[i]) ttsMs[i] = 0L
+                trans[i] = newTr
                 refreshLabel(i)
             }
+            .setNeutralButton("▶ အသံ") { _, _ -> playTts(i) }
             .setNegativeButton("Cancel", null)
             .show()
     }
+
+    // ---------------- TTS ----------------
+
+    private fun ttsFile(i: Int) = File(cacheDir, "tts_${segments[i].index}.wav")
+
+    private fun playTts(i: Int) {
+        if (i >= ttsMs.size || ttsMs[i] <= 0L) {
+            Toast.makeText(this, "အသံ မထုတ်ရသေးပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val f = ttsFile(i)
+        if (!f.exists()) return
+        ttsPlayer?.release()
+        val p = MediaPlayer()
+        try {
+            p.setDataSource(f.absolutePath)
+            p.prepare()
+            p.setOnCompletionListener { it.release() }
+            p.start()
+            ttsPlayer = p
+        } catch (e: Exception) {
+            p.release()
+        }
+    }
+
+    private fun onTts() {
+        if (ttsRunning) {
+            ttsStop = true
+            tts?.stop()
+            return
+        }
+        if (segments.isEmpty()) return
+        val todo = segments.indices.filter { !trans[it].isNullOrBlank() }
+        if (todo.isEmpty()) {
+            Toast.makeText(this, "မြန်မာ ဘာသာပြန် မရှိသေးပါ (Paste All အရင်လုပ်ပါ)", Toast.LENGTH_LONG).show()
+            return
+        }
+        ensureTts { ok ->
+            if (ok) {
+                ttsQueue = todo
+                ttsPos = 0
+                ttsStop = false
+                ttsRunning = true
+                updateButtons()
+                ttsNext()
+            }
+        }
+    }
+
+    private fun ensureTts(cb: (Boolean) -> Unit) {
+        if (ttsReady && tts != null) {
+            cb(true)
+            return
+        }
+        Toast.makeText(this, "TTS စစ်နေပါတယ်...", Toast.LENGTH_SHORT).show()
+        tts?.shutdown()
+        tts = null
+        ttsReady = false
+        tts = TextToSpeech(this, TextToSpeech.OnInitListener { st ->
+            handler.post {
+                val t = tts
+                if (st != TextToSpeech.SUCCESS || t == null) {
+                    showTtsHelp("TTS engine မစနိုင်ပါ။ ဖုန်းမှာ TTS engine မရှိ ဒါမှမဟုတ် ပိတ်ထားနိုင်ပါတယ်။")
+                    cb(false)
+                } else {
+                    var r = t.setLanguage(Locale("my", "MM"))
+                    if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+                        r = t.setLanguage(Locale("my"))
+                    }
+                    if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+                        showTtsHelp("ဒီဖုန်းမှာ မြန်မာ TTS voice မတွေ့ပါ။")
+                        cb(false)
+                    } else {
+                        t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                            override fun onStart(utteranceId: String?) {}
+                            override fun onDone(utteranceId: String?) {
+                                onTtsDone(utteranceId, true)
+                            }
+                            override fun onError(utteranceId: String?) {
+                                onTtsDone(utteranceId, false)
+                            }
+                        })
+                        ttsReady = true
+                        cb(true)
+                    }
+                }
+            }
+        })
+    }
+
+    private fun showTtsHelp(msg: String) {
+        AlertDialog.Builder(this)
+            .setTitle("မြန်မာ TTS")
+            .setMessage(
+                msg + "\n\nစစ်ကြည့်ရန်:\nSettings → Additional settings (သို့) System → Language → " +
+                    "Text-to-speech output။ Engine က Google Speech Services ဖြစ်ရမယ်။ " +
+                    "⚙ ကိုနှိပ် → Install voice data မှာ Myanmar ရှိမရှိ ကြည့်ပါ။\n\n" +
+                    "မရှိရင် ကျွန်တော့်ကို ပြောပါ၊ တခြားနည်း ရှာပေးမယ်။"
+            )
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
+    private fun ttsNext() {
+        val t = tts
+        if (ttsStop || t == null || ttsPos >= ttsQueue.size) {
+            ttsRunning = false
+            updateButtons()
+            updateStatus()
+            return
+        }
+        val i = ttsQueue[ttsPos]
+        val text = trans[i] ?: ""
+        val r = t.synthesizeToFile(text, Bundle(), ttsFile(i), "p$i")
+        if (r != TextToSpeech.SUCCESS) {
+            ttsPos++
+            ttsNext()
+        }
+    }
+
+    private fun onTtsDone(uid: String?, ok: Boolean) {
+        handler.post {
+            val i = uid?.removePrefix("p")?.toIntOrNull()
+            if (i != null && ok && i < segments.size) {
+                val f = ttsFile(i)
+                if (f.exists()) {
+                    val mr = MediaMetadataRetriever()
+                    try {
+                        mr.setDataSource(f.absolutePath)
+                        val d = mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                            ?.toLongOrNull() ?: 0L
+                        ttsMs[i] = d
+                        refreshLabel(i)
+                    } catch (e: Exception) {
+                    } finally {
+                        mr.release()
+                    }
+                }
+            }
+            ttsPos++
+            ttsNext()
+        }
+    }
+
+    // ---------------- Video ----------------
 
     private fun pickVideo() {
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
@@ -522,15 +761,23 @@ Rules:
     private fun loadVideo(uri: Uri) {
         handler.removeCallbacks(ticker)
         if (running) stopReq = true
+        if (ttsRunning) {
+            ttsStop = true
+            tts?.stop()
+        }
         prepared = false
         player = null
         segments = emptyList()
         texts = arrayOfNulls<String>(0)
         trans = arrayOfNulls<String>(0)
+        ttsMs = LongArray(0)
         pcmFile = null
         labels.clear()
         adapter.notifyDataSetChanged()
-        cacheDir.listFiles()?.forEach { if (it.name.startsWith("audio_")) it.delete() }
+        cacheDir.listFiles()?.forEach {
+            if (it.name.startsWith("audio_") || it.name.startsWith("tts_")) it.delete()
+        }
+        updateStatus()
         val id = ++loadId
 
         var dur = 0L
@@ -584,10 +831,12 @@ Rules:
         segments = segs
         texts = arrayOfNulls<String>(segs.size)
         trans = arrayOfNulls<String>(segs.size)
-        info.text = "$head  |  Segments: ${segs.size}\n$mode\n(စာကို ကြာကြာနှိပ်ရင် ပြင်လို့ရပါတယ်)"
+        ttsMs = LongArray(segs.size)
+        info.text = "$head  |  Segments: ${segs.size}\n$mode • Preview ကိုနှိပ်ရင် ကြီး/သေး • စာကို ကြာကြာနှိပ်ရင် ပြင်"
         labels.clear()
         for (i in segs.indices) labels.add(label(i))
         adapter.notifyDataSetChanged()
+        updateStatus()
     }
 
     private fun fixedSegments(totalMs: Long): List<Segment> {
@@ -805,6 +1054,9 @@ Rules:
     override fun onDestroy() {
         handler.removeCallbacks(ticker)
         stopReq = true
+        ttsStop = true
+        tts?.shutdown()
+        ttsPlayer?.release()
         super.onDestroy()
     }
 
