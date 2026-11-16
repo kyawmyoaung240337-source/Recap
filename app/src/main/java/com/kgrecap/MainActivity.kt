@@ -6,6 +6,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.media.MediaCodec
 import android.media.MediaExtractor
@@ -15,6 +16,7 @@ import android.media.MediaPlayer
 import android.media.PlaybackParams
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
@@ -50,6 +52,7 @@ class MainActivity : Activity() {
     private val maxMs = 15_000
     private val skipGapMs = 3_000
     private val pickCode = 1
+    private val exportPermissionCode = 4
     private val videoHeightRatio = 0.36
 
     private val videoOpts = doubleArrayOf(1.1, 1.3, 1.5)
@@ -92,6 +95,7 @@ class MainActivity : Activity() {
     private lateinit var btnVoiceId: Button
     private lateinit var btnPause: Button
     private lateinit var btnSample: Button
+    private lateinit var btnExport: Button
     private lateinit var sec0: Button
     private lateinit var sec1: Button
     private lateinit var sec2: Button
@@ -123,6 +127,8 @@ class MainActivity : Activity() {
     @Volatile private var ttsStop = false
     private var sampling = false
     private var ttsPlayer: MediaPlayer? = null
+    private var sourceVideoUri: Uri? = null
+    @Volatile private var exporting = false
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -241,6 +247,7 @@ class MainActivity : Activity() {
 
         // ----- အသံ panel -----
         btnTts = button("") { onTts() }
+        btnExport = button("Render / Save MP4") { onExport() }
         btnVoice = button("") { cycleVoice() }
         btnVoiceId = button("Voice ID ထည့်") { askCustomVoice() }
         btnPause = button("") { cyclePause() }
@@ -250,6 +257,7 @@ class MainActivity : Activity() {
         panel2.addView(row(btnPause, btnSample))
         panel2.addView(speedRow())
         panel2.addView(btnTts)
+        panel2.addView(btnExport)
 
         sec0 = button("") { togglePanel(0) }
         sec1 = button("") { togglePanel(1) }
@@ -422,7 +430,22 @@ class MainActivity : Activity() {
         updateRunButton()
         updatePasteButton()
         updateTtsButton()
+        updateExportButton()
         updateSections()
+    }
+
+    private fun updateExportButton() {
+        if (!::btnExport.isInitialized) return
+        val ready = segments.isNotEmpty() && trans.indices.all { i ->
+            texts[i] != null && (texts[i].isNullOrBlank() ||
+                (!trans[i].isNullOrBlank() && ttsMs[i] > 0L && ttsFile(i).isFile))
+        }
+        btnExport.text = when {
+            exporting -> "Video render လုပ်နေပါတယ်..."
+            ready -> "Render / Save MP4 ✓"
+            else -> "Render / Save MP4\nTranslation + TTS ပြီးမှ"
+        }
+        btnExport.isEnabled = !exporting
     }
 
     private fun modelFile() = File(filesDir, models[modelIdx].second)
@@ -953,6 +976,105 @@ Text-to-speech rules (everything you write will be spoken aloud):
         }
     }
 
+    private fun onExport() {
+        if (exporting) return
+        val source = sourceVideoUri
+        if (source == null || segments.isEmpty()) {
+            Toast.makeText(this, "Video အရင်ရွေးပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (texts.any { it == null }) {
+            Toast.makeText(this, "စာထုတ်ခြင်း (Transcribe) အရင် အကုန်ပြီးအောင်လုပ်ပါ", Toast.LENGTH_LONG).show()
+            return
+        }
+        val missing = segments.indices.filter { i ->
+            !texts[i].isNullOrBlank() &&
+                (trans[i].isNullOrBlank() || ttsMs[i] <= 0L || !ttsFile(i).isFile)
+        }
+        if (missing.isNotEmpty()) {
+            Toast.makeText(
+                this,
+                "Translation နဲ့ TTS မပြီးသေးတဲ့အပိုင်း: ${missing.map { segments[it].index }.joinToString(", ")}",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        if (trans.none { !it.isNullOrBlank() }) {
+            Toast.makeText(this, "မြန်မာဘာသာပြန်မရှိပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+            checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), exportPermissionCode
+            )
+            return
+        }
+
+        val segSnapshot = segments.toList()
+        val textSnapshot = trans.copyOf()
+        val fileSnapshot = segments.indices.map { i ->
+            if (textSnapshot[i].isNullOrBlank()) null else ttsFile(i)
+        }
+        val speedSnapshot = DoubleArray(segments.size) { i -> audioSpeedOf(i) }
+        exporting = true
+        updateProgress()
+        Thread {
+            try {
+                val savedUri = VideoExporter.export(
+                    this@MainActivity, source, segSnapshot, textSnapshot, fileSnapshot, speedSnapshot
+                )
+                runOnUiThread {
+                    exporting = false
+                    updateProgress()
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Export ပြီးပါပြီ")
+                        .setMessage("Video ကို Movies/Recap ထဲမှာ သိမ်းပြီးပါပြီ။")
+                        .setPositiveButton("ဖွင့်ကြည့်မယ်") { _, _ -> openExport(savedUri) }
+                        .setNeutralButton("မျှဝေမယ်") { _, _ -> shareExport(savedUri) }
+                        .setNegativeButton("ပြီးပြီ", null)
+                        .show()
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    exporting = false
+                    updateProgress()
+                    val message = e.message?.takeLast(900) ?: "မသိသော export error"
+                    Toast.makeText(this@MainActivity, "Export မအောင်မြင်ပါ: $message", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun openExport(uri: Uri) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "video/mp4")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            })
+        } catch (e: Exception) {
+            Toast.makeText(this, "Gallery ထဲက Movies/Recap folder မှာကြည့်ပါ", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun shareExport(uri: Uri) {
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "video/mp4"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(send, "Video မျှဝေပါ"))
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == exportPermissionCode) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) onExport()
+            else Toast.makeText(this, "Video ကို Gallery ထဲသိမ်းဖို့ storage permission လိုပါတယ်", Toast.LENGTH_LONG).show()
+        }
+    }
+
     // ကွင်းစာ၊ ..., symbol တွေကို ဖယ် (၊ ။ ကိုတော့ ထားမယ်)
     private fun cleanForTts(t: String): String {
         var s = t.replace(Regex("[(（\\[【][^)）\\]】]*[)）\\]】]"), " ")
@@ -976,6 +1098,10 @@ Text-to-speech rules (everything you write will be spoken aloud):
     // ---------------- Video ----------------
 
     private fun pickVideo() {
+        if (exporting) {
+            Toast.makeText(this, "Render ပြီးမှ video အသစ်ရွေးပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "video/*"
@@ -996,6 +1122,7 @@ Text-to-speech rules (everything you write will be spoken aloud):
     }
 
     private fun loadVideo(uri: Uri) {
+        sourceVideoUri = uri
         handler.removeCallbacks(ticker)
         if (running) stopReq = true
         if (ttsRunning) ttsStop = true
