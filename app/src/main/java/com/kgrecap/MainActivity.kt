@@ -36,11 +36,11 @@ import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
-import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.log10
 
 data class Segment(val index: Int, val startMs: Long, val endMs: Long)
@@ -54,10 +54,15 @@ class MainActivity : Activity() {
 
     private val videoOpts = doubleArrayOf(1.1, 1.3, 1.5)
     private val voiceOpts = doubleArrayOf(1.0, 1.1, 1.2, 1.3)
-    private val maxVoiceTotal = 1.4
+    private val pauseOpts = doubleArrayOf(0.6, 1.0, 1.5)
+    private val pauseNames = arrayOf("နည်း", "ပုံမှန်", "များ")
+    private val maxExtra = 1.15
     private val sylPerSec = 4.5
     private var videoSpeed = 1.3
     private var voiceSpeed = 1.2
+    private var pauseIdx = 1
+    private var voiceIdx = 0
+    private var customVoice = ""
 
     private val langs = listOf(
         "zh" to "Chinese", "en" to "English", "th" to "Thai",
@@ -83,6 +88,10 @@ class MainActivity : Activity() {
     private lateinit var btnCopy: Button
     private lateinit var btnPaste: Button
     private lateinit var btnTts: Button
+    private lateinit var btnVoice: Button
+    private lateinit var btnVoiceId: Button
+    private lateinit var btnPause: Button
+    private lateinit var btnSample: Button
     private lateinit var sec0: Button
     private lateinit var sec1: Button
     private lateinit var sec2: Button
@@ -112,6 +121,7 @@ class MainActivity : Activity() {
 
     @Volatile private var ttsRunning = false
     @Volatile private var ttsStop = false
+    private var sampling = false
     private var ttsPlayer: MediaPlayer? = null
 
     private val ticker = object : Runnable {
@@ -167,7 +177,6 @@ class MainActivity : Activity() {
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
 
-        // Video: အပေါ်ဆုံးမှာ ကပ်ထား၊ အလယ်တည့်တည့်
         video = VideoView(this)
         val box = FrameLayout(this)
         box.setBackgroundColor(Color.BLACK)
@@ -232,7 +241,13 @@ class MainActivity : Activity() {
 
         // ----- အသံ panel -----
         btnTts = button("") { onTts() }
+        btnVoice = button("") { cycleVoice() }
+        btnVoiceId = button("Voice ID ထည့်") { askCustomVoice() }
+        btnPause = button("") { cyclePause() }
+        btnSample = button("▶ နမူနာ") { playSample() }
         panel2 = vbox()
+        panel2.addView(row(btnVoice, btnVoiceId))
+        panel2.addView(row(btnPause, btnSample))
         panel2.addView(speedRow())
         panel2.addView(btnTts)
 
@@ -240,7 +255,6 @@ class MainActivity : Activity() {
         sec1 = button("") { togglePanel(1) }
         sec2 = button("") { togglePanel(2) }
 
-        // ခလုတ်တွေကို စာရင်းရဲ့ header အဖြစ်ထည့် → အောက်ဆွဲရင် အတူပါသွား
         val header = LinearLayout(this)
         header.orientation = LinearLayout.VERTICAL
         header.setPadding(16, 12, 16, 8)
@@ -296,7 +310,7 @@ class MainActivity : Activity() {
         sec2.text = (if (openPanel == 2) "▾ " else "") + "အသံ" + (if (tr > 0) " ${nTts()}/$tr" else "")
     }
 
-    // ---------------- Speed ----------------
+    // ---------------- Speed / Voice ----------------
 
     private fun cycleVideoSpeed() {
         val i = videoOpts.indexOfFirst { Math.abs(it - videoSpeed) < 0.001 }
@@ -306,10 +320,79 @@ class MainActivity : Activity() {
     }
 
     private fun cycleVoiceSpeed() {
+        if (ttsRunning) {
+            Toast.makeText(this, "TTS ရပ်ပြီးမှ ပြောင်းပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
         val i = voiceOpts.indexOfFirst { Math.abs(it - voiceSpeed) < 0.001 }
         voiceSpeed = voiceOpts[(i + 1) % voiceOpts.size]
         updateSpeedButtons()
+        invalidateTts()
+    }
+
+    private fun cyclePause() {
+        if (ttsRunning) {
+            Toast.makeText(this, "TTS ရပ်ပြီးမှ ပြောင်းပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
+        pauseIdx = (pauseIdx + 1) % pauseOpts.size
+        updateVoiceButtons()
+        invalidateTts()
+    }
+
+    private fun cycleVoice() {
+        if (ttsRunning) {
+            Toast.makeText(this, "TTS ရပ်ပြီးမှ ပြောင်းပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val total = EdgeTts.presets.size + (if (customVoice.isNotBlank()) 1 else 0)
+        voiceIdx = (voiceIdx + 1) % total
+        updateVoiceButtons()
+        invalidateTts()
+    }
+
+    private fun askCustomVoice() {
+        if (ttsRunning) return
+        val e = EditText(this)
+        e.setText(customVoice)
+        e.hint = "ဥပမာ my-MM-ThihaNeural"
+        e.setPadding(48, 32, 48, 16)
+        AlertDialog.Builder(this)
+            .setTitle("Edge voice ID")
+            .setView(e)
+            .setPositiveButton("Save") { _, _ ->
+                customVoice = e.text.toString().trim()
+                voiceIdx = if (customVoice.isNotEmpty()) EdgeTts.presets.size else 0
+                updateVoiceButtons()
+                invalidateTts()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun voiceId(): String =
+        if (voiceIdx < EdgeTts.presets.size) EdgeTts.presets[voiceIdx].id else customVoice
+
+    private fun voicePitch(): Int =
+        if (voiceIdx < EdgeTts.presets.size) EdgeTts.presets[voiceIdx].pitchHz else 0
+
+    private fun voiceRatePct(): Int = Math.round((voiceSpeed - 1.0) * 100).toInt()
+
+    private fun updateVoiceButtons() {
+        btnVoice.text = "Voice: " +
+            (if (voiceIdx < EdgeTts.presets.size) EdgeTts.presets[voiceIdx].label else "Custom")
+        btnPause.text = "နားချိန်: " + pauseNames[pauseIdx]
+    }
+
+    // အသံ setting ပြောင်းရင် ထုတ်ပြီးသား အသံတွေ ပျက်ပြီ
+    private fun invalidateTts() {
+        val any = ttsMs.any { it > 0L }
+        for (i in ttsMs.indices) ttsMs[i] = 0L
+        cacheDir.listFiles()?.forEach { if (it.name.startsWith("tts_")) it.delete() }
         refreshAll()
+        if (any) {
+            Toast.makeText(this, "အသံ setting ပြောင်းလို့ TTS ပြန်ထုတ်ရပါမယ်", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun updateSpeedButtons() {
@@ -331,6 +414,7 @@ class MainActivity : Activity() {
         btnModel.text = "Model: ${models[modelIdx].first}"
         btnOut.text = if (toEnglish) "Output: English" else "Output: Original"
         updateSpeedButtons()
+        updateVoiceButtons()
         updateProgress()
     }
 
@@ -531,12 +615,11 @@ class MainActivity : Activity() {
     // video speed အရ ပြောခွင့်ရတဲ့ အချိန်
     private fun slotSec(i: Int) = clipSec(i) / videoSpeed
 
+    // ထုတ်ပြီးသား အသံက အချိန်ထက်ရှည်ရင် ထပ်မြှင့်ရမယ့် speed (အများဆုံး maxExtra)
     private fun audioSpeedOf(i: Int): Double {
         val e = slotSec(i)
         val t = ttsMs[i] / 1000.0
-        var a = voiceSpeed
-        if (e > 0.0 && t / a > e) a = minOf(t / e, maxVoiceTotal)
-        return a
+        return if (e > 0.0 && t > e) minOf(t / e, maxExtra) else 1.0
     }
 
     private fun plan(i: Int): String {
@@ -546,7 +629,7 @@ class MainActivity : Activity() {
         val a = audioSpeedOf(i)
         val flag = if (t / a > e + 0.05) "  ⚠ စာရှည်နေသေး (တိုပါ)" else ""
         return String.format(
-            Locale.US, "🔊 %.1fs | video %.1fs→%.1fs (%.1fx) | အသံ %.2fx→%.1fs%s",
+            Locale.US, "🔊 %.1fs | video %.1fs→%.1fs (%.1fx) | အသံ ထပ်မြှင့် %.2fx→%.1fs%s",
             t, c, e, videoSpeed, a, t / a, flag
         )
     }
@@ -620,8 +703,9 @@ Timing rules (very important):
 
 Text-to-speech rules (everything you write will be spoken aloud):
 11. Plain words only. No parentheses, brackets, ellipsis (...), emoji, symbols or stage directions.
-12. Do not add words such as ရှင်, ရှင့်, ခင်ဗျာ, ဗျာ, ကွယ်, နော် (gender or politeness endings). Write neutral plain spoken sentences.
-13. Do not add any word that is not part of the original meaning."""
+12. Use the Myanmar punctuation marks ၊ and ။ properly. The voice-over pauses at them. Put ၊ at every natural short pause inside a sentence (about every 6 to 12 syllables) and end every sentence with ။. Never write a long run-on line without them.
+13. Do not add words such as ရှင်, ရှင့်, ခင်ဗျာ, ဗျာ, ကွယ်, နော် (gender or politeness endings). Write neutral plain spoken sentences.
+14. Do not add any word that is not part of the original meaning."""
     }
 
     private fun copyAll() {
@@ -726,16 +810,11 @@ Text-to-speech rules (everything you write will be spoken aloud):
             .show()
     }
 
-    // ---------------- TTS (online) ----------------
+    // ---------------- TTS (Edge) ----------------
 
-    private fun ttsFile(i: Int) = File(cacheDir, "tts_${segments[i].index}.mp3")
+    private fun ttsFile(i: Int) = File(cacheDir, "tts_${segments[i].index}.wav")
 
-    private fun playTts(i: Int) {
-        if (i >= ttsMs.size || ttsMs[i] <= 0L) {
-            Toast.makeText(this, "အသံ မထုတ်ရသေးပါ", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val f = ttsFile(i)
+    private fun playFile(f: File, speed: Double) {
         if (!f.exists()) return
         ttsPlayer?.release()
         val p = MediaPlayer()
@@ -743,16 +822,59 @@ Text-to-speech rules (everything you write will be spoken aloud):
             p.setDataSource(f.absolutePath)
             p.prepare()
             p.setOnCompletionListener { it.release() }
-            try {
-                p.playbackParams = PlaybackParams()
-                    .setSpeed(audioSpeedOf(i).toFloat())
-                    .setPitch(1.0f)
-            } catch (e: Exception) { }
+            if (speed > 1.001) {
+                try {
+                    p.playbackParams = PlaybackParams().setSpeed(speed.toFloat()).setPitch(1.0f)
+                } catch (e: Exception) { }
+            }
             if (!p.isPlaying) p.start()
             ttsPlayer = p
         } catch (e: Exception) {
             p.release()
         }
+    }
+
+    private fun playTts(i: Int) {
+        if (i >= ttsMs.size || ttsMs[i] <= 0L) {
+            Toast.makeText(this, "အသံ မထုတ်ရသေးပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
+        playFile(ttsFile(i), audioSpeedOf(i))
+    }
+
+    private fun playSample() {
+        if (sampling) return
+        val voice = voiceId()
+        if (voice.isBlank()) {
+            Toast.makeText(this, "Voice ID မရှိပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
+        sampling = true
+        btnSample.text = "ထုတ်နေ..."
+        val pitch = voicePitch()
+        val rate = voiceRatePct()
+        val ps = pauseOpts[pauseIdx]
+        Thread {
+            var err: String? = null
+            val f = File(cacheDir, "sample.wav")
+            try {
+                EdgeTts.speak(
+                    "မင်္ဂလာပါ၊ ဒီအသံကို ကြားရပါသလား။ ဇာတ်လမ်းထဲက စကားပြောကို၊ အခုလို ဖတ်ပေးပါမယ်။",
+                    voice, pitch, rate, ps, f, cacheDir
+                )
+            } catch (e: Exception) {
+                err = e.message ?: e.toString()
+            }
+            runOnUiThread {
+                sampling = false
+                btnSample.text = "▶ နမူနာ"
+                if (err != null) {
+                    Toast.makeText(this@MainActivity, "TTS error: $err", Toast.LENGTH_LONG).show()
+                } else {
+                    playFile(f, 1.0)
+                }
+            }
+        }.start()
     }
 
     private fun onTts() {
@@ -762,6 +884,11 @@ Text-to-speech rules (everything you write will be spoken aloud):
             return
         }
         if (segments.isEmpty()) return
+        val voice = voiceId()
+        if (voice.isBlank()) {
+            Toast.makeText(this, "Voice ID မရှိပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
         val all = segments.indices.filter { !trans[it].isNullOrBlank() }
         if (all.isEmpty()) {
             Toast.makeText(this, "မြန်မာ ဘာသာပြန် မရှိသေးပါ (Paste All အရင်လုပ်ပါ)", Toast.LENGTH_LONG).show()
@@ -770,7 +897,7 @@ Text-to-speech rules (everything you write will be spoken aloud):
         val todo = all.filter { ttsMs[it] <= 0L }
         if (todo.isEmpty()) {
             Toast.makeText(
-                this, "အသံ အကုန်ပြီးပြီ။ ပြန်ထုတ်ချင်တဲ့အပိုင်းကို ကြာကြာနှိပ်ပြီး Save လုပ်ပါ",
+                this, "အသံ အကုန်ပြီးပြီ။ ပြန်ထုတ်ချင်ရင် Voice/Speed/နားချိန် ပြောင်းပါ",
                 Toast.LENGTH_LONG
             ).show()
             return
@@ -780,86 +907,58 @@ Text-to-speech rules (everything you write will be spoken aloud):
         updateTtsButton()
         val id = loadId
         val tr = trans
-        Thread {
-            var err: String? = null
-            for (i in todo) {
-                if (ttsStop || id != loadId) break
-                val text = cleanForTts(tr[i] ?: "")
-                if (text.isEmpty()) continue
-                try {
-                    val f = ttsFile(i)
-                    onlineSynth(text, f)
-                    val d = durationOf(f)
-                    if (d <= 0L) throw RuntimeException("အသံဖိုင် မမှန်ပါ")
+        val pitch = voicePitch()
+        val rate = voiceRatePct()
+        val ps = pauseOpts[pauseIdx]
+        val next = AtomicInteger(0)
+        val finished = AtomicInteger(0)
+        val errRef = AtomicReference<String?>(null)
+        val nThreads = 3
+
+        for (k in 0 until nThreads) {
+            Thread {
+                while (!ttsStop && id == loadId && errRef.get() == null) {
+                    val j = next.getAndIncrement()
+                    if (j >= todo.size) break
+                    val i = todo[j]
+                    val text = cleanForTts(tr[i] ?: "")
+                    if (text.isEmpty()) continue
+                    try {
+                        val f = ttsFile(i)
+                        EdgeTts.speak(text, voice, pitch, rate, ps, f, cacheDir)
+                        val d = durationOf(f)
+                        if (d <= 0L) throw RuntimeException("အသံဖိုင် မမှန်ပါ")
+                        runOnUiThread {
+                            if (id == loadId) {
+                                ttsMs[i] = d
+                                refreshLabel(i)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        errRef.compareAndSet(null, e.message ?: e.toString())
+                    }
+                }
+                if (finished.incrementAndGet() == nThreads) {
                     runOnUiThread {
-                        if (id == loadId) {
-                            ttsMs[i] = d
-                            refreshLabel(i)
+                        ttsRunning = false
+                        ttsStop = false
+                        updateTtsButton()
+                        val e = errRef.get()
+                        if (e != null) {
+                            Toast.makeText(this@MainActivity, "TTS error: $e", Toast.LENGTH_LONG).show()
                         }
                     }
-                } catch (e: Exception) {
-                    err = e.message ?: e.toString()
-                    break
                 }
-            }
-            runOnUiThread {
-                ttsRunning = false
-                ttsStop = false
-                updateTtsButton()
-                if (err != null) {
-                    Toast.makeText(this@MainActivity, "TTS error: $err", Toast.LENGTH_LONG).show()
-                }
-            }
-        }.start()
+            }.start()
+        }
     }
 
-    // ကွင်းစာ၊ ..., symbol တွေကို အသံမထွက်အောင် ဖယ်
+    // ကွင်းစာ၊ ..., symbol တွေကို ဖယ် (၊ ။ ကိုတော့ ထားမယ်)
     private fun cleanForTts(t: String): String {
         var s = t.replace(Regex("[(（\\[【][^)）\\]】]*[)）\\]】]"), " ")
         s = s.replace("...", "။ ").replace("…", "။ ")
         s = s.replace(Regex("[*#_~`<>]"), " ")
-        return s.replace(Regex("\\s+"), " ").trim()
-    }
-
-    private fun onlineSynth(text: String, out: File) {
-        val chunks = splitText(text, 120)
-        if (chunks.isEmpty()) throw RuntimeException("စာမရှိပါ")
-        FileOutputStream(out).use { os ->
-            for (c in chunks) {
-                val q = URLEncoder.encode(c, "UTF-8")
-                val url = URL("https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=my&q=$q")
-                val con = url.openConnection() as HttpURLConnection
-                con.setRequestProperty(
-                    "User-Agent",
-                    "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36"
-                )
-                con.connectTimeout = 15000
-                con.readTimeout = 30000
-                if (con.responseCode != 200) throw RuntimeException("TTS HTTP ${con.responseCode}")
-                con.inputStream.use { it.copyTo(os) }
-            }
-        }
-    }
-
-    private fun splitText(t: String, max: Int): List<String> {
-        val out = ArrayList<String>()
-        var cur = StringBuilder()
-        fun flush() {
-            val s = cur.toString().trim()
-            if (s.isNotEmpty()) out.add(s)
-            cur = StringBuilder()
-        }
-        for (ch in t) {
-            if (ch == '\n') {
-                flush()
-                continue
-            }
-            cur.append(ch)
-            val p = ch == '။' || ch == '၊' || ch == '.' || ch == '!' || ch == '?'
-            if (p || cur.length >= max || (ch == ' ' && cur.length >= max * 7 / 10)) flush()
-        }
-        flush()
-        return out
+        return s.replace(Regex("[ \\t]+"), " ").trim()
     }
 
     private fun durationOf(f: File): Long {
