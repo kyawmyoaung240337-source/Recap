@@ -21,23 +21,30 @@ Java_com_kgrecap_WhisperBridge_nativeFree(JNIEnv *, jobject, jlong ptr) {
 
 JNIEXPORT jstring JNICALL
 Java_com_kgrecap_WhisperBridge_nativeTranscribe(JNIEnv *env, jobject, jlong ptr,
-                                                jfloatArray audio, jstring lang, jint threads) {
+                                                jfloatArray audio, jstring lang,
+                                                jint threads, jboolean translate) {
     auto *ctx = reinterpret_cast<whisper_context *>(ptr);
     if (ctx == nullptr) return env->NewStringUTF("");
     jsize n = env->GetArrayLength(audio);
     jfloat *data = env->GetFloatArrayElements(audio, nullptr);
     const char *l = env->GetStringUTFChars(lang, nullptr);
+    std::string ls(l);
+    bool tr = (translate == JNI_TRUE);
 
     whisper_full_params wp = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     wp.print_realtime = false;
     wp.print_progress = false;
     wp.print_timestamps = false;
     wp.print_special = false;
-    wp.translate = false;
+    wp.translate = tr;
     wp.no_context = true;
     wp.n_threads = threads;
     wp.language = l;
-    wp.detect_language = (std::string(l) == "auto");
+    wp.detect_language = (ls == "auto");
+    wp.suppress_blank = true;
+    if (ls == "zh" && !tr) {
+        wp.initial_prompt = "以下是普通话的句子。";
+    }
 
     std::string out;
     if (whisper_full(ctx, wp, data, n) == 0) {
