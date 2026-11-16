@@ -12,11 +12,13 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
+import android.media.PlaybackParams
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.widget.AbsListView
 import android.widget.ArrayAdapter
@@ -48,9 +50,14 @@ class MainActivity : Activity() {
     private val maxMs = 15_000
     private val skipGapMs = 3_000
     private val pickCode = 1
-    private val maxAudioSpeed = 1.2
-    private val maxVideoSpeed = 1.3
     private val videoHeightRatio = 0.36
+
+    private val videoOpts = doubleArrayOf(1.1, 1.3, 1.5)
+    private val voiceOpts = doubleArrayOf(1.0, 1.1, 1.2, 1.3)
+    private val maxVoiceTotal = 1.4
+    private val sylPerSec = 4.5
+    private var videoSpeed = 1.3
+    private var voiceSpeed = 1.2
 
     private val langs = listOf(
         "zh" to "Chinese", "en" to "English", "th" to "Thai",
@@ -76,6 +83,15 @@ class MainActivity : Activity() {
     private lateinit var btnCopy: Button
     private lateinit var btnPaste: Button
     private lateinit var btnTts: Button
+    private lateinit var sec0: Button
+    private lateinit var sec1: Button
+    private lateinit var sec2: Button
+    private lateinit var panel0: LinearLayout
+    private lateinit var panel1: LinearLayout
+    private lateinit var panel2: LinearLayout
+    private val videoSpBtns = ArrayList<Button>()
+    private val voiceSpBtns = ArrayList<Button>()
+    private var openPanel = -1
 
     private val labels = ArrayList<String>()
     private var player: MediaPlayer? = null
@@ -127,6 +143,21 @@ class MainActivity : Activity() {
         return l
     }
 
+    private fun vbox(): LinearLayout {
+        val l = LinearLayout(this)
+        l.orientation = LinearLayout.VERTICAL
+        l.visibility = View.GONE
+        return l
+    }
+
+    private fun speedRow(): LinearLayout {
+        val bv = button("") { cycleVideoSpeed() }
+        val ba = button("") { cycleVoiceSpeed() }
+        videoSpBtns.add(bv)
+        voiceSpBtns.add(ba)
+        return row(bv, ba)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         actionBar?.hide()
@@ -151,6 +182,8 @@ class MainActivity : Activity() {
         root.addView(box, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, videoH))
 
         val btnPick = button("Video ရွေးပါ") { pickVideo() }
+
+        // ----- စာထုတ် panel -----
         btnLang = button("") {
             langIdx = (langIdx + 1) % langs.size
             updateButtons()
@@ -181,9 +214,31 @@ class MainActivity : Activity() {
             }
         }
         btnRun = button("") { onRun() }
+        panel0 = vbox()
+        panel0.addView(row(btnLang, btnWorkers, btnModel))
+        panel0.addView(row(btnOut))
+        panel0.addView(btnRun)
+
+        // ----- ဘာသာပြန် panel -----
         btnCopy = button("Copy All (+AI)") { copyAll() }
         btnPaste = button("") { pasteAll() }
+        val hint = TextView(this)
+        hint.textSize = 11f
+        hint.text = "Speed ကို Copy All မလုပ်ခင် ရွေးပါ။ ပြောင်းရင် Copy All ပြန်လုပ်ပါ။"
+        panel1 = vbox()
+        panel1.addView(speedRow())
+        panel1.addView(hint)
+        panel1.addView(row(btnCopy, btnPaste))
+
+        // ----- အသံ panel -----
         btnTts = button("") { onTts() }
+        panel2 = vbox()
+        panel2.addView(speedRow())
+        panel2.addView(btnTts)
+
+        sec0 = button("") { togglePanel(0) }
+        sec1 = button("") { togglePanel(1) }
+        sec2 = button("") { togglePanel(2) }
 
         // ခလုတ်တွေကို စာရင်းရဲ့ header အဖြစ်ထည့် → အောက်ဆွဲရင် အတူပါသွား
         val header = LinearLayout(this)
@@ -193,9 +248,10 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         )
         header.addView(btnPick)
-        header.addView(row(btnLang, btnWorkers, btnModel))
-        header.addView(row(btnOut, btnRun))
-        header.addView(row(btnCopy, btnPaste, btnTts))
+        header.addView(row(sec0, sec1, sec2))
+        header.addView(panel0)
+        header.addView(panel1)
+        header.addView(panel2)
 
         list = ListView(this)
         list.addHeaderView(header, null, false)
@@ -214,13 +270,59 @@ class MainActivity : Activity() {
 
         setContentView(root)
         updateButtons()
+        applyPanels()
     }
 
-    // ---------------- ခလုတ်ပေါ်က progress ----------------
+    // ---------------- Panel ----------------
+
+    private fun togglePanel(k: Int) {
+        openPanel = if (openPanel == k) -1 else k
+        applyPanels()
+    }
+
+    private fun applyPanels() {
+        panel0.visibility = if (openPanel == 0) View.VISIBLE else View.GONE
+        panel1.visibility = if (openPanel == 1) View.VISIBLE else View.GONE
+        panel2.visibility = if (openPanel == 2) View.VISIBLE else View.GONE
+        updateSections()
+    }
+
+    private fun updateSections() {
+        val n = texts.size
+        val sp = nSpeech()
+        val tr = nTransAll()
+        sec0.text = (if (openPanel == 0) "▾ " else "") + "စာထုတ်" + (if (n > 0) " ${nDone()}/$n" else "")
+        sec1.text = (if (openPanel == 1) "▾ " else "") + "ဘာသာပြန်" + (if (sp > 0) " ${nTrans()}/$sp" else "")
+        sec2.text = (if (openPanel == 2) "▾ " else "") + "အသံ" + (if (tr > 0) " ${nTts()}/$tr" else "")
+    }
+
+    // ---------------- Speed ----------------
+
+    private fun cycleVideoSpeed() {
+        val i = videoOpts.indexOfFirst { Math.abs(it - videoSpeed) < 0.001 }
+        videoSpeed = videoOpts[(i + 1) % videoOpts.size]
+        updateSpeedButtons()
+        refreshAll()
+    }
+
+    private fun cycleVoiceSpeed() {
+        val i = voiceOpts.indexOfFirst { Math.abs(it - voiceSpeed) < 0.001 }
+        voiceSpeed = voiceOpts[(i + 1) % voiceOpts.size]
+        updateSpeedButtons()
+        refreshAll()
+    }
+
+    private fun updateSpeedButtons() {
+        videoSpBtns.forEach { it.text = String.format(Locale.US, "Video speed: %.1fx", videoSpeed) }
+        voiceSpBtns.forEach { it.text = String.format(Locale.US, "Voice speed: %.1fx", voiceSpeed) }
+    }
+
+    // ---------------- Progress ----------------
 
     private fun nDone() = texts.count { it != null }
     private fun nSpeech() = texts.count { !it.isNullOrBlank() }
     private fun nTrans() = texts.indices.count { !texts[it].isNullOrBlank() && !trans[it].isNullOrBlank() }
+    private fun nTransAll() = trans.count { !it.isNullOrBlank() }
     private fun nTts() = ttsMs.count { it > 0L }
 
     private fun updateButtons() {
@@ -228,6 +330,7 @@ class MainActivity : Activity() {
         btnWorkers.text = "Workers: $workers"
         btnModel.text = "Model: ${models[modelIdx].first}"
         btnOut.text = if (toEnglish) "Output: English" else "Output: Original"
+        updateSpeedButtons()
         updateProgress()
     }
 
@@ -235,6 +338,7 @@ class MainActivity : Activity() {
         updateRunButton()
         updatePasteButton()
         updateTtsButton()
+        updateSections()
     }
 
     private fun modelFile() = File(filesDir, models[modelIdx].second)
@@ -264,7 +368,7 @@ class MainActivity : Activity() {
 
     private fun updateTtsButton() {
         val t = nTts()
-        val tr = nTrans()
+        val tr = nTransAll()
         btnTts.text = when {
             ttsRunning && ttsStop -> "ရပ်နေပါတယ်..."
             ttsRunning -> "အသံထုတ်နေ $t/$tr • ရပ်မယ်"
@@ -420,22 +524,30 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------------- စာရင်း label ----------------
+    // ---------------- စာရင်း label / plan ----------------
+
+    private fun clipSec(i: Int) = (segments[i].endMs - segments[i].startMs) / 1000.0
+
+    // video speed အရ ပြောခွင့်ရတဲ့ အချိန်
+    private fun slotSec(i: Int) = clipSec(i) / videoSpeed
+
+    private fun audioSpeedOf(i: Int): Double {
+        val e = slotSec(i)
+        val t = ttsMs[i] / 1000.0
+        var a = voiceSpeed
+        if (e > 0.0 && t / a > e) a = minOf(t / e, maxVoiceTotal)
+        return a
+    }
 
     private fun plan(i: Int): String {
-        val c = (segments[i].endMs - segments[i].startMs) / 1000.0
+        val c = clipSec(i)
+        val e = slotSec(i)
         val t = ttsMs[i] / 1000.0
-        var aSp = 1.0
-        var vSp = 1.0
-        var flag = ""
-        if (t > c) {
-            aSp = minOf(t / c, maxAudioSpeed)
-            if (t / aSp > c + 0.05) flag = "  ⚠ စာရှည်နေသေး (တိုပါ)"
-        } else if (t < c) {
-            vSp = minOf(c / t, maxVideoSpeed)
-        }
+        val a = audioSpeedOf(i)
+        val flag = if (t / a > e + 0.05) "  ⚠ စာရှည်နေသေး (တိုပါ)" else ""
         return String.format(
-            Locale.US, "🔊 %.1fs | clip %.1fs | အသံ %.2fx | video %.2fx%s", t, c, aSp, vSp, flag
+            Locale.US, "🔊 %.1fs | video %.1fs→%.1fs (%.1fx) | အသံ %.2fx→%.1fs%s",
+            t, c, e, videoSpeed, a, t / a, flag
         )
     }
 
@@ -444,7 +556,7 @@ class MainActivity : Activity() {
         val t = texts[i]
         val tr = trans[i]
         var r = "[%03d]  %s - %s  (%.1fs)".format(
-            s.index, fmt(s.startMs), fmt(s.endMs), (s.endMs - s.startMs) / 1000.0
+            s.index, fmt(s.startMs), fmt(s.endMs), clipSec(i)
         )
         if (t != null) r += "\n" + (if (t.isBlank()) "(စကားမပါ)" else t)
         if (!tr.isNullOrBlank()) r += "\n➜ " + tr
@@ -490,21 +602,26 @@ class MainActivity : Activity() {
         return """[INSTRUCTION FOR AI TRANSLATOR]
 Translate each numbered dialogue part below from $src into natural spoken Myanmar (မြန်မာ).
 These lines come from a drama scene. Write them as natural character dialogue, not as a narrator. Use the neighbouring parts to work out the real meaning when the text looks wrong.
-The lines will be read aloud by a voice-over, so timing matters.
+The lines will be read aloud by a text-to-speech voice-over, so timing and clean text matter.
 
 Rules:
 1. Keep every part separate. Never merge, split or move lines between parts.
-2. Keep each header line exactly as given, including the times and the limit, for example [Part 3 • 00:20 - 00:25 • 5.0s • max 22 syllables].
+2. Keep each header line exactly as given, including the times and the limit, for example [Part 3 • 00:20 - 00:25 • 3.8s • max 21 syllables].
 3. Under each header write only the translated spoken line, in Myanmar Unicode script. Write names and foreign words in Myanmar script too.
 4. No markdown, no speaker names, no notes, no explanations, no greetings.
 5. Separate the parts with this exact line: ----------------------------------------
 6. Return only the translated parts.
 
 Timing rules (very important):
-7. Each header shows the clip length in seconds and a syllable limit.
-8. The Myanmar line must be speakable at normal speed within that clip length. Stay at or under the syllable limit.
+7. The number of seconds in each header is the time the spoken line may take. The syllable limit is given too.
+8. The Myanmar line must be speakable within that time. Stay at or under the syllable limit.
 9. If the full translation is too long, shorten it. Keep the same meaning. Drop filler words and repeated phrases, but never change the facts, names or the emotion.
-10. A line shorter than the limit is fine."""
+10. A line shorter than the limit is fine.
+
+Text-to-speech rules (everything you write will be spoken aloud):
+11. Plain words only. No parentheses, brackets, ellipsis (...), emoji, symbols or stage directions.
+12. Do not add words such as ရှင်, ရှင့်, ခင်ဗျာ, ဗျာ, ကွယ်, နော် (gender or politeness endings). Write neutral plain spoken sentences.
+13. Do not add any word that is not part of the original meaning."""
     }
 
     private fun copyAll() {
@@ -512,11 +629,11 @@ Timing rules (very important):
         segments.forEachIndexed { i, s ->
             val t = texts[i]
             if (!t.isNullOrBlank()) {
-                val sec = (s.endMs - s.startMs) / 1000.0
-                val maxSyl = maxOf(3, Math.round(sec * 4.5).toInt())
+                val e = slotSec(i)
+                val maxSyl = maxOf(3, Math.round(e * sylPerSec * voiceSpeed).toInt())
                 val head = String.format(
                     Locale.US, "[Part %d • %s - %s • %.1fs • max %d syllables]",
-                    s.index, mmss(s.startMs), mmss(s.endMs), sec, maxSyl
+                    s.index, mmss(s.startMs), mmss(s.endMs), e, maxSyl
                 )
                 parts.add("$head\n$t")
             }
@@ -626,7 +743,12 @@ Timing rules (very important):
             p.setDataSource(f.absolutePath)
             p.prepare()
             p.setOnCompletionListener { it.release() }
-            p.start()
+            try {
+                p.playbackParams = PlaybackParams()
+                    .setSpeed(audioSpeedOf(i).toFloat())
+                    .setPitch(1.0f)
+            } catch (e: Exception) { }
+            if (!p.isPlaying) p.start()
             ttsPlayer = p
         } catch (e: Exception) {
             p.release()
@@ -662,7 +784,8 @@ Timing rules (very important):
             var err: String? = null
             for (i in todo) {
                 if (ttsStop || id != loadId) break
-                val text = tr[i] ?: continue
+                val text = cleanForTts(tr[i] ?: "")
+                if (text.isEmpty()) continue
                 try {
                     val f = ttsFile(i)
                     onlineSynth(text, f)
@@ -688,6 +811,14 @@ Timing rules (very important):
                 }
             }
         }.start()
+    }
+
+    // ကွင်းစာ၊ ..., symbol တွေကို အသံမထွက်အောင် ဖယ်
+    private fun cleanForTts(t: String): String {
+        var s = t.replace(Regex("[(（\\[【][^)）\\]】]*[)）\\]】]"), " ")
+        s = s.replace("...", "။ ").replace("…", "။ ")
+        s = s.replace(Regex("[*#_~`<>]"), " ")
+        return s.replace(Regex("\\s+"), " ").trim()
     }
 
     private fun onlineSynth(text: String, out: File) {
@@ -841,6 +972,8 @@ Timing rules (very important):
         labels.clear()
         for (i in segs.indices) labels.add(label(i))
         adapter.notifyDataSetChanged()
+        openPanel = 0
+        applyPanels()
         updateProgress()
         Toast.makeText(
             this, "$head | Segments: ${segs.size} | $mode\n(စာကို ကြာကြာနှိပ်ရင် ပြင်လို့ရ)",
