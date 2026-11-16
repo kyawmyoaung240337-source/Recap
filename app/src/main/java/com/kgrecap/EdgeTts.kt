@@ -14,7 +14,6 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -30,7 +29,6 @@ class SkewException(msg: String) : Exception(msg)
 object EdgeTts {
     private const val TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
     private const val CHROMIUM = "143.0.3650.75"
-    private const val WIN_EPOCH = 11644473600L
     private const val PAUSE_COMMA = 280
     private const val PAUSE_STOP = 550
 
@@ -55,15 +53,9 @@ object EdgeTts {
 
     // ---------- auth ----------
 
-    private fun gec(): String {
-        var t = System.currentTimeMillis() / 1000 + skewSec + WIN_EPOCH
-        t -= t % 300
-        val s = (t * 10_000_000L).toString() + TOKEN
-        val d = MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.US_ASCII))
-        val sb = StringBuilder()
-        for (b in d) sb.append(String.format("%02X", b))
-        return sb.toString()
-    }
+    // Sec-MS-GEC v2 token (Gec.kt မှာ)
+    private fun gec(): String =
+        Gec.v2(TOKEN, System.currentTimeMillis() / 1000 + skewSec)
 
     private fun stamp(): String {
         val f = SimpleDateFormat("EEE MMM dd yyyy HH:mm:ss", Locale.US)
@@ -105,7 +97,7 @@ object EdgeTts {
         val id = UUID.randomUUID().toString().replace("-", "")
         val url = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1" +
             "?TrustedClientToken=$TOKEN&ConnectionId=$id" +
-            "&Sec-MS-GEC=${gec()}&Sec-MS-GEC-Version=1-$CHROMIUM"
+            "&Sec-MS-GEC=${gec()}&Sec-MS-GEC-Version=2-$CHROMIUM"
         val major = CHROMIUM.substringBefore('.')
         val muid = UUID.randomUUID().toString().replace("-", "").uppercase(Locale.US)
         val req = Request.Builder().url(url)
