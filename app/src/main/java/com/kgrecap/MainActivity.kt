@@ -1,6 +1,7 @@
 package com.kgrecap
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -17,8 +18,10 @@ import android.os.Looper
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import android.widget.VideoView
@@ -51,6 +54,7 @@ class MainActivity : Activity() {
     private var langIdx = 0
     private var workers = 2
     private var modelIdx = 0
+    private var toEnglish = true
 
     private lateinit var info: TextView
     private lateinit var list: ListView
@@ -59,13 +63,16 @@ class MainActivity : Activity() {
     private lateinit var btnLang: Button
     private lateinit var btnWorkers: Button
     private lateinit var btnModel: Button
+    private lateinit var btnOut: Button
     private lateinit var btnRun: Button
     private lateinit var btnCopy: Button
+    private lateinit var btnPaste: Button
 
     private val labels = ArrayList<String>()
     private var player: MediaPlayer? = null
     private var segments: List<Segment> = emptyList()
     private var texts: Array<String?> = arrayOfNulls<String>(0)
+    private var trans: Array<String?> = arrayOfNulls<String>(0)
     private var pcmFile: File? = null
     private var prepared = false
     private var startAt = 0L
@@ -128,8 +135,22 @@ class MainActivity : Activity() {
                 updateButtons()
             }
         }
+        btnOut = button("") {
+            if (!running) {
+                toEnglish = !toEnglish
+                if (texts.any { it != null }) {
+                    clearTexts()
+                    Toast.makeText(
+                        this, "Output ပြောင်းလို့ စာတွေ ရှင်းပြီး၊ Transcribe ပြန်လုပ်ပါ",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                updateButtons()
+            }
+        }
         btnRun = button("") { onRun() }
         btnCopy = button("Copy All (+AI)") { copyAll() }
+        btnPaste = button("Paste All") { pasteAll() }
 
         info = TextView(this)
         info.textSize = 14f
@@ -143,12 +164,17 @@ class MainActivity : Activity() {
         list.setOnItemClickListener { _, _, pos, _ ->
             if (pos in segments.indices) playSegment(segments[pos])
         }
+        list.setOnItemLongClickListener { _, _, pos, _ ->
+            if (pos in segments.indices) editSegment(pos)
+            true
+        }
 
         root.addView(btnPick)
         root.addView(info)
-        root.addView(video, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 500))
+        root.addView(video, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 450))
         root.addView(row(btnLang, btnWorkers, btnModel))
-        root.addView(row(btnRun, btnCopy))
+        root.addView(row(btnOut, btnRun))
+        root.addView(row(btnCopy, btnPaste))
         root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
         updateButtons()
@@ -158,6 +184,7 @@ class MainActivity : Activity() {
         btnLang.text = "Lang: ${langs[langIdx].second}"
         btnWorkers.text = "Workers: $workers"
         btnModel.text = "Model: ${models[modelIdx].first}"
+        btnOut.text = if (toEnglish) "Output: English" else "Output: Original"
         updateRunButton()
     }
 
@@ -251,6 +278,7 @@ class MainActivity : Activity() {
         val segs = segments
         val tx = texts
         val lang = langs[langIdx].first
+        val translate = toEnglish
         val nWorkers = workers
         val threads = maxOf(1, minOf(4, Runtime.getRuntime().availableProcessors() / nWorkers))
         val modelPath = modelFile().absolutePath
@@ -273,7 +301,7 @@ class MainActivity : Activity() {
                             if (tx[i] != null) continue
                             val audio = readPcm(pcm, segs[i])
                             val text = if (audio.size < 1600) ""
-                            else WhisperBridge.nativeTranscribe(ptr, audio, lang, threads).trim()
+                            else WhisperBridge.nativeTranscribe(ptr, audio, lang, threads, translate).trim()
                             runOnUiThread {
                                 if (id == loadId) {
                                     tx[i] = text
@@ -320,10 +348,13 @@ class MainActivity : Activity() {
     private fun label(i: Int): String {
         val s = segments[i]
         val t = texts[i]
-        val h = "[%03d]  %s - %s  (%.1fs)".format(
+        val tr = trans[i]
+        var r = "[%03d]  %s - %s  (%.1fs)".format(
             s.index, fmt(s.startMs), fmt(s.endMs), (s.endMs - s.startMs) / 1000.0
         )
-        return if (t == null) h else h + "\n" + (if (t.isBlank()) "(စကားမပါ)" else t)
+        if (t != null) r += "\n" + (if (t.isBlank()) "(စကားမပါ)" else t)
+        if (!tr.isNullOrBlank()) r += "\n➜ " + tr
+        return r
     }
 
     private fun refreshLabel(i: Int) {
@@ -333,18 +364,44 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun refreshAll() {
+        for (i in labels.indices) labels[i] = label(i)
+        adapter.notifyDataSetChanged()
+    }
+
+    private fun clearTexts() {
+        for (i in texts.indices) {
+            texts[i] = null
+            trans[i] = null
+        }
+        refreshAll()
+    }
+
     private fun mmss(ms: Long): String {
         val s = ms / 1000
         return "%02d:%02d".format(s / 60, s % 60)
     }
 
-    private val promptText = """[INSTRUCTION FOR AI TRANSLATOR]
+    private val promptEnglish = """[INSTRUCTION FOR AI TRANSLATOR]
+Translate each numbered dialogue part below from English into natural spoken Myanmar (မြန်မာ).
+These lines come from a Chinese drama. The English was produced by speech recognition and machine translation, so it may contain mistakes. Use the neighbouring parts to work out the real meaning.
+Write the lines as natural character dialogue, not as a narrator.
+
+Rules:
+1. Keep every part separate. Never merge, split or move lines between parts.
+2. Keep each [Part N • start - end] header line exactly as given.
+3. Under each header write only the translated spoken line, in Myanmar Unicode script. Write names and foreign words in Myanmar script too.
+4. No markdown, no speaker names, no notes, no explanations, no greetings.
+5. Separate the parts with this exact line: ----------------------------------------
+6. Return only the translated parts."""
+
+    private val promptOriginal = """[INSTRUCTION FOR AI TRANSLATOR]
 Translate each numbered dialogue part below into natural spoken Myanmar (မြန်မာ).
 These are lines from a movie scene. Write them as natural character dialogue, not as a narrator. The transcript comes from speech recognition and may contain mistakes, so use the neighbouring parts to work out the real meaning.
 
 Rules:
 1. Keep every part separate. Never merge, split or move lines between parts.
-2. Keep each header line exactly as given, for example [Part 3 • 00:20 - 00:25].
+2. Keep each [Part N • start - end] header line exactly as given.
 3. Under each header write only the translated spoken line, in Myanmar Unicode script. Write names and foreign words in Myanmar script too.
 4. No markdown, no speaker names, no notes, no explanations, no greetings.
 5. Separate the parts with this exact line: ----------------------------------------
@@ -362,11 +419,84 @@ Rules:
             Toast.makeText(this, "Copy ကူးစရာ စာမရှိသေးပါ", Toast.LENGTH_SHORT).show()
             return
         }
-        val text = promptText + "\n\n[INPUT TRANSCRIPT PARTS TO TRANSLATE]\n" +
+        val prompt = if (toEnglish) promptEnglish else promptOriginal
+        val text = prompt + "\n\n[INPUT TRANSCRIPT PARTS TO TRANSLATE]\n" +
             parts.joinToString("\n----------------------------------------\n")
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText("kgrecap", text))
         Toast.makeText(this, "Copied ${parts.size} parts", Toast.LENGTH_SHORT).show()
+    }
+
+    private val partRe = Regex("""\[Part\s*(\d+)[^\]]*]""")
+
+    private fun pasteAll() {
+        if (segments.isEmpty()) {
+            Toast.makeText(this, "Video ရွေးပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = cm.primaryClip
+        val raw = if (clip != null && clip.itemCount > 0)
+            clip.getItemAt(0).coerceToText(this).toString() else ""
+        val ms = partRe.findAll(raw).toList()
+        if (ms.isEmpty()) {
+            Toast.makeText(this, "[Part 1 • ...] ပုံစံ မတွေ့ပါ။ Gemini ရလဒ်ကို Copy အရင်လုပ်ပါ", Toast.LENGTH_LONG).show()
+            return
+        }
+        var ok = 0
+        ms.forEachIndexed { k, m ->
+            val no = m.groupValues[1].toInt()
+            val end = if (k + 1 < ms.size) ms[k + 1].range.first else raw.length
+            val body = raw.substring(m.range.last + 1, end)
+                .replace(Regex("-{5,}"), "")
+                .trim()
+                .trim('*', ' ', '\n')
+            val idx = segments.indexOfFirst { it.index == no }
+            if (idx >= 0 && body.isNotEmpty()) {
+                trans[idx] = body
+                ok++
+            }
+        }
+        refreshAll()
+        val missing = segments.indices
+            .filter { !texts[it].isNullOrBlank() && trans[it].isNullOrBlank() }
+            .map { segments[it].index }
+        var msg = "Paste ပြီး: $ok parts"
+        if (missing.isNotEmpty()) msg += "\nမပါသေးတာ: " + missing.joinToString(", ")
+        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+    }
+
+    private fun editSegment(i: Int) {
+        val s = segments[i]
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(40, 20, 40, 0)
+        val l1 = TextView(this)
+        l1.text = "မူရင်းစာ (Whisper)"
+        val e1 = EditText(this)
+        e1.setText(texts[i] ?: "")
+        val l2 = TextView(this)
+        l2.text = "မြန်မာ ဘာသာပြန်"
+        l2.setPadding(0, 24, 0, 0)
+        val e2 = EditText(this)
+        e2.setText(trans[i] ?: "")
+        box.addView(l1)
+        box.addView(e1)
+        box.addView(l2)
+        box.addView(e2)
+        val sv = ScrollView(this)
+        sv.addView(box)
+        AlertDialog.Builder(this)
+            .setTitle("Part ${s.index}  ${fmt(s.startMs)}")
+            .setView(sv)
+            .setPositiveButton("Save") { _, _ ->
+                texts[i] = e1.text.toString().trim()
+                val t = e2.text.toString().trim()
+                trans[i] = if (t.isEmpty()) null else t
+                refreshLabel(i)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun pickVideo() {
@@ -396,6 +526,7 @@ Rules:
         player = null
         segments = emptyList()
         texts = arrayOfNulls<String>(0)
+        trans = arrayOfNulls<String>(0)
         pcmFile = null
         labels.clear()
         adapter.notifyDataSetChanged()
@@ -452,7 +583,8 @@ Rules:
     private fun showSegments(segs: List<Segment>, head: String, mode: String) {
         segments = segs
         texts = arrayOfNulls<String>(segs.size)
-        info.text = "$head  |  Segments: ${segs.size}\n$mode"
+        trans = arrayOfNulls<String>(segs.size)
+        info.text = "$head  |  Segments: ${segs.size}\n$mode\n(စာကို ကြာကြာနှိပ်ရင် ပြင်လို့ရပါတယ်)"
         labels.clear()
         for (i in segs.indices) labels.add(label(i))
         adapter.notifyDataSetChanged()
@@ -465,7 +597,6 @@ Rules:
         }
     }
 
-    // အသံကို decode → 16kHz mono PCM ဖိုင်ထုတ် + 50ms frame တစ်ခုချင်းရဲ့ volume (dB) ပြန်ပေး
     private fun decodeAudio(uri: Uri, outFile: File): FloatArray {
         val ex = MediaExtractor()
         ex.setDataSource(this, uri, null)
