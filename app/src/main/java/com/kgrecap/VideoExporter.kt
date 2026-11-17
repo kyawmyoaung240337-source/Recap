@@ -2,6 +2,7 @@ package com.kgrecap
 
 import android.content.ContentValues
 import android.content.Context
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
@@ -13,7 +14,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/** Creates a subtitled MP4 with the app's generated Myanmar voice-over and saves it to Movies/Recap. */
+/** Subtitled MP4 + Myanmar voice-over → Movies/Recap. Background thread ကနေ ခေါ်ပါ။ */
 object VideoExporter {
     private data class VoiceTrack(val input: File, val startMs: Long, val speed: Double)
 
@@ -41,56 +42,122 @@ object VideoExporter {
         val cache = File(context.cacheDir, "recap_export").apply { mkdirs() }
         val inputVideo = File(cache, "source.mp4")
         val subtitleFile = File(cache, "captions.ass")
+        val videoPart = File(cache, "video_sub.mp4")
+        val audioPart = File(cache, "audio.m4a")
         val outputVideo = File(cache, "rendered.mp4")
         val fontDir = File(cache, "fonts").apply { mkdirs() }
         val fontFile = File(fontDir, "NotoSansMyanmar.ttf")
 
         try {
+            Breadcrumb.mark("1/7 source video ကူးနေ")
             context.contentResolver.openInputStream(source)?.use { input ->
                 FileOutputStream(inputVideo).use { output -> input.copyTo(output) }
             } ?: error("Cannot read the selected video.")
 
+            Breadcrumb.mark("2/7 font ကူးနေ (assets/fonts/NotoSansMyanmar.ttf)")
             copyBundledFont(context, fontFile)
-            val durationMs = segments.maxOf { it.endMs }
-            writeAss(subtitleFile, segments, translations, inputVideo)
-            outputVideo.delete()
+            setFontDir(context, fontDir)
 
-            val audioGraph = buildAudioGraph(voices)
-            val baseArgs = mutableListOf(
-                "-hide_banner", "-loglevel", "error", "-y", "-i", inputVideo.absolutePath
-            )
-            voices.forEach { baseArgs.addAll(listOf("-i", it.input.absolutePath)) }
-            baseArgs.addAll(
+            Breadcrumb.mark("3/7 caption ဖိုင်ရေးနေ")
+            val durationMs = segments.maxOf { it.endMs }
+            val (width, height) = videoSize(inputVideo)
+            writeAss(subtitleFile, segments, translations, width, height)
+            val tSec = String.format(Locale.US, "%.3f", durationMs / 1000.0)
+
+            // ၁) video + subtitle (အသံမပါ)
+            videoPart.delete()
+            runFfmpeg(
+                "4/7 FFmpeg: video + subtitle",
                 listOf(
-                    "-filter_complex", audioGraph,
-                    "-map", "0:v:0",
+                    "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", inputVideo.absolutePath,
+                    "-an",
+                    "-vf", subtitleFilter(subtitleFile, fontDir, minOf(width, height)),
+                    "-t", tSec,
+                    "-c:v", "mpeg4", "-q:v", "4", "-threads", "2",
+                    videoPart.absolutePath
+                ),
+                videoPart
+            )
+
+            // ၂) မြန်မာအသံတွေ ပေါင်း
+            audioPart.delete()
+            val audioArgs = mutableListOf("-hide_banner", "-loglevel", "error", "-y")
+            voices.forEach { audioArgs.addAll(listOf("-i", it.input.absolutePath)) }
+            audioArgs.addAll(
+                listOf(
+                    "-filter_complex", buildAudioGraph(voices),
                     "-map", "[aout]",
-                    "-vf", subtitleFilter(subtitleFile, fontDir, inputVideo),
-                    "-t", String.format(Locale.US, "%.3f", durationMs / 1000.0),
+                    "-t", tSec,
                     "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart",
-                    outputVideo.absolutePath
+                    audioPart.absolutePath
                 )
             )
+            runFfmpeg("5/7 FFmpeg: audio mix", audioArgs, audioPart)
 
-            // Use FFmpeg's software MPEG-4 encoder directly. Some Android devices crash
-            // inside their MediaCodec H.264 encoder instead of returning an FFmpeg error.
-            val renderArgs = baseArgs.toMutableList().apply {
-                val at = indexOf("-c:a")
-                addAll(at, listOf("-c:v", "mpeg4", "-q:v", "4", "-threads", "2"))
-            }
-            val session = FFmpegKit.executeWithArguments(renderArgs.toTypedArray())
-            if (!ReturnCode.isSuccess(session.returnCode) || !outputVideo.isFile || outputVideo.length() < 1024L) {
-                val details = session.output.orEmpty().takeLast(1800)
-                throw IllegalStateException(details.ifBlank { "Video encoding failed. Please try another video." })
-            }
+            // ၃) video + audio ပေါင်း (re-encode မလုပ်)
+            outputVideo.delete()
+            runFfmpeg(
+                "6/7 FFmpeg: mux",
+                listOf(
+                    "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", videoPart.absolutePath,
+                    "-i", audioPart.absolutePath,
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    outputVideo.absolutePath
+                ),
+                outputVideo
+            )
 
-            return saveToGallery(context, outputVideo)
+            Breadcrumb.mark("7/7 gallery ထဲ save နေ")
+            val uri = saveToGallery(context, outputVideo)
+            Breadcrumb.clear()
+            return uri
+        } catch (t: Throwable) {
+            Breadcrumb.clear()
+            throw t
         } finally {
             inputVideo.delete()
             subtitleFile.delete()
+            videoPart.delete()
+            audioPart.delete()
             outputVideo.delete()
             fontFile.delete()
+        }
+    }
+
+    // FFmpegKitConfig.setFontDirectory ကို reflection နဲ့ ခေါ် (library fork မှာ မရှိလည်း build မပျက်အောင်)
+    private fun setFontDir(context: Context, dir: File) {
+        try {
+            val c = Class.forName("com.arthenica.ffmpegkit.FFmpegKitConfig")
+            val m = c.getMethod(
+                "setFontDirectory",
+                Context::class.java, String::class.java, Map::class.java
+            )
+            m.invoke(null, context, dir.absolutePath, null)
+        } catch (e: Throwable) { }
+    }
+
+    private fun runFfmpeg(stage: String, args: List<String>, out: File) {
+        Breadcrumb.mark(stage)
+        val session = FFmpegKit.executeWithArguments(args.toTypedArray())
+        if (!ReturnCode.isSuccess(session.returnCode) || !out.isFile || out.length() < 1024L) {
+            val details = session.output.orEmpty().takeLast(1800)
+            throw IllegalStateException("[$stage] " + details.ifBlank { "FFmpeg မအောင်မြင်ပါ" })
+        }
+    }
+
+    private fun videoSize(f: File): Pair<Int, Int> {
+        val r = MediaMetadataRetriever()
+        return try {
+            r.setDataSource(f.absolutePath)
+            val w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 720
+            val h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1280
+            w to h
+        } finally {
+            r.release()
         }
     }
 
@@ -99,9 +166,7 @@ object VideoExporter {
         voices.forEachIndexed { i, track ->
             val delay = track.startMs.coerceAtLeast(0L)
             val speed = String.format(Locale.US, "%.3f", track.speed)
-            parts.add(
-                "[${i + 1}:a]aresample=48000,atempo=$speed,adelay=delays=$delay:all=1[a$i]"
-            )
+            parts.add("[$i:a]aresample=48000,atempo=$speed,adelay=delays=$delay:all=1[a$i]")
         }
         val inputs = voices.indices.joinToString(separator = "") { "[a$it]" }
         parts.add("${inputs}amix=inputs=${voices.size}:duration=longest:normalize=0:dropout_transition=0,alimiter=limit=0.95[aout]")
@@ -112,18 +177,9 @@ object VideoExporter {
         target: File,
         segments: List<Segment>,
         translations: Array<String?>,
-        videoFile: File
+        width: Int,
+        height: Int
     ) {
-        // Use the Android decoder metadata to size subtitles proportionally to the source frame.
-        val retriever = android.media.MediaMetadataRetriever()
-        val (width, height) = try {
-            retriever.setDataSource(videoFile.absolutePath)
-            val w = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 720
-            val h = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1280
-            w to h
-        } finally {
-            retriever.release()
-        }
         val fontSize = (minOf(width, height) * 0.052).toInt().coerceIn(28, 68)
         val marginV = (height * 0.045).toInt().coerceAtLeast(24)
         val content = buildString {
@@ -167,34 +223,22 @@ object VideoExporter {
         return String.format(Locale.US, "%d:%02d:%02d.%02d", hour, min, sec, cs)
     }
 
-    private fun subtitleFilter(
-        subtitle: File,
-        fontDir: File,
-        videoFile: File
-    ): String {
-        // App-private absolute paths contain no shell quoting; escape filter separators explicitly.
+    private fun subtitleFilter(subtitle: File, fontDir: File, minDim: Int): String {
         fun esc(file: File): String = file.absolutePath
             .replace("\\", "\\\\")
             .replace(":", "\\:")
             .replace("'", "\\'")
-        val retriever = android.media.MediaMetadataRetriever()
-        val minDim = try {
-            retriever.setDataSource(videoFile.absolutePath)
-            minOf(
-                retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 720,
-                retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1280
-            )
-        } finally {
-            retriever.release()
-        }
         val size = (minDim * 0.052).toInt().coerceIn(28, 68)
         return "subtitles='${esc(subtitle)}':fontsdir='${esc(fontDir)}':force_style='FontName=Noto Sans Myanmar,FontSize=$size,Outline=2.5,Shadow=1,Alignment=2'"
     }
 
     private fun copyBundledFont(context: Context, target: File) {
-        context.assets.open("fonts/NotoSansMyanmar.ttf").use { input ->
-            FileOutputStream(target).use { output -> input.copyTo(output) }
+        val input = try {
+            context.assets.open("fonts/NotoSansMyanmar.ttf")
+        } catch (e: Exception) {
+            throw IllegalStateException("assets/fonts/NotoSansMyanmar.ttf မရှိပါ (app/src/main/assets/fonts/ ထဲ ထည့်ပါ)")
         }
+        input.use { i -> FileOutputStream(target).use { o -> i.copyTo(o) } }
     }
 
     private fun saveToGallery(context: Context, source: File): Uri {
