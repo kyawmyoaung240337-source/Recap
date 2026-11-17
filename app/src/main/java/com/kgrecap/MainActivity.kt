@@ -1036,7 +1036,7 @@ Text-to-speech rules (everything you write will be spoken aloud):
                         .setNegativeButton("ပြီးပြီ", null)
                         .show()
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 runOnUiThread {
                     exporting = false
                     updateProgress()
