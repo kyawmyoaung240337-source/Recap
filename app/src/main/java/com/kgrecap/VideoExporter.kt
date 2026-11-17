@@ -73,20 +73,13 @@ object VideoExporter {
                 )
             )
 
-            // Try device H.264 hardware encoder first; fall back to the widely supported MPEG-4 encoder.
-            val hardwareArgs = baseArgs.toMutableList().apply {
+            // Use FFmpeg's software MPEG-4 encoder directly. Some Android devices crash
+            // inside their MediaCodec H.264 encoder instead of returning an FFmpeg error.
+            val renderArgs = baseArgs.toMutableList().apply {
                 val at = indexOf("-c:a")
-                addAll(at, listOf("-c:v", "h264_mediacodec", "-b:v", "4M"))
+                addAll(at, listOf("-c:v", "mpeg4", "-q:v", "4", "-threads", "2"))
             }
-            var session = FFmpegKit.executeWithArguments(hardwareArgs.toTypedArray())
-            if (!ReturnCode.isSuccess(session.returnCode) || !outputVideo.isFile || outputVideo.length() < 1024L) {
-                outputVideo.delete()
-                val fallbackArgs = baseArgs.toMutableList().apply {
-                    val at = indexOf("-c:a")
-                    addAll(at, listOf("-c:v", "mpeg4", "-q:v", "4"))
-                }
-                session = FFmpegKit.executeWithArguments(fallbackArgs.toTypedArray())
-            }
+            val session = FFmpegKit.executeWithArguments(renderArgs.toTypedArray())
             if (!ReturnCode.isSuccess(session.returnCode) || !outputVideo.isFile || outputVideo.length() < 1024L) {
                 val details = session.output.orEmpty().takeLast(1800)
                 throw IllegalStateException(details.ifBlank { "Video encoding failed. Please try another video." })
