@@ -1,15 +1,23 @@
 package com.kgrecap
 
+import android.app.Activity
+import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.widget.ScrollView
+import android.widget.TextView
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
 import java.io.File
 import java.io.FileOutputStream
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -17,6 +25,13 @@ import java.util.Locale
 /** Subtitled MP4 + Myanmar voice-over → Movies/Recap. Background thread ကနေ ခေါ်ပါ။ */
 object VideoExporter {
     private data class VoiceTrack(val input: File, val startMs: Long, val speed: Double)
+
+    @Volatile private var lastStage = ""
+
+    private fun stage(s: String) {
+        lastStage = s
+        Breadcrumb.mark(s)
+    }
 
     fun export(
         context: Context,
@@ -26,6 +41,7 @@ object VideoExporter {
         ttsFiles: List<File?>,
         ttsSpeeds: DoubleArray
     ): Uri {
+        lastStage = "စတင်နေ"
         require(segments.isNotEmpty()) { "No video segments to export." }
         require(translations.size == segments.size && ttsFiles.size == segments.size && ttsSpeeds.size == segments.size) {
             "Video data changed. Please try again."
@@ -49,16 +65,16 @@ object VideoExporter {
         val fontFile = File(fontDir, "NotoSansMyanmar.ttf")
 
         try {
-            Breadcrumb.mark("1/7 source video ကူးနေ")
+            stage("1/7 source video ကူးနေ")
             context.contentResolver.openInputStream(source)?.use { input ->
                 FileOutputStream(inputVideo).use { output -> input.copyTo(output) }
             } ?: error("Cannot read the selected video.")
 
-            Breadcrumb.mark("2/7 font ကူးနေ (assets/fonts/NotoSansMyanmar.ttf)")
+            stage("2/7 font ကူးနေ (assets/fonts/NotoSansMyanmar.ttf)")
             copyBundledFont(context, fontFile)
             setFontDir(context, fontDir)
 
-            Breadcrumb.mark("3/7 caption ဖိုင်ရေးနေ")
+            stage("3/7 caption ဖိုင်ရေးနေ")
             val durationMs = segments.maxOf { it.endMs }
             val (width, height) = videoSize(inputVideo)
             writeAss(subtitleFile, segments, translations, width, height)
@@ -111,12 +127,14 @@ object VideoExporter {
                 outputVideo
             )
 
-            Breadcrumb.mark("7/7 gallery ထဲ save နေ")
+            stage("7/7 gallery ထဲ save နေ")
             val uri = saveToGallery(context, outputVideo)
             Breadcrumb.clear()
             return uri
         } catch (t: Throwable) {
+            val st = lastStage
             Breadcrumb.clear()
+            showError(context, st, t)
             throw t
         } finally {
             inputVideo.delete()
@@ -125,6 +143,39 @@ object VideoExporter {
             audioPart.delete()
             outputVideo.delete()
             fontFile.delete()
+        }
+    }
+
+    // Error အပြည့်ကို dialog နဲ့ ပြ (Toast က စာတိုတိုပဲ ပြလို့)
+    private fun showError(context: Context, st: String, t: Throwable) {
+        val a = context as? Activity ?: return
+        val sw = StringWriter()
+        t.printStackTrace(PrintWriter(sw))
+        val full = "အဆင့်: $st\n\n$sw"
+        val short = full.lines().filter {
+            it.startsWith("အဆင့်") || it.contains("Exception") || it.contains("Error") ||
+                it.contains("Caused by") || it.contains("kgrecap") || it.contains("ffmpegkit") ||
+                it.contains("dlopen") || it.contains("symbol") || it.contains(".so")
+        }.take(40).joinToString("\n")
+        a.runOnUiThread {
+            try {
+                val tv = TextView(a)
+                tv.text = short
+                tv.textSize = 11f
+                tv.setTextIsSelectable(true)
+                tv.setPadding(32, 16, 32, 16)
+                val sv = ScrollView(a)
+                sv.addView(tv)
+                AlertDialog.Builder(a)
+                    .setTitle("Export error")
+                    .setView(sv)
+                    .setPositiveButton("Copy") { _, _ ->
+                        val cm = a.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("error", full.take(12000)))
+                    }
+                    .setNegativeButton("Close", null)
+                    .show()
+            } catch (e: Throwable) { }
         }
     }
 
@@ -140,12 +191,12 @@ object VideoExporter {
         } catch (e: Throwable) { }
     }
 
-    private fun runFfmpeg(stage: String, args: List<String>, out: File) {
-        Breadcrumb.mark(stage)
+    private fun runFfmpeg(st: String, args: List<String>, out: File) {
+        stage(st)
         val session = FFmpegKit.executeWithArguments(args.toTypedArray())
         if (!ReturnCode.isSuccess(session.returnCode) || !out.isFile || out.length() < 1024L) {
             val details = session.output.orEmpty().takeLast(1800)
-            throw IllegalStateException("[$stage] " + details.ifBlank { "FFmpeg မအောင်မြင်ပါ" })
+            throw IllegalStateException("[$st] " + details.ifBlank { "FFmpeg မအောင်မြင်ပါ" })
         }
     }
 
