@@ -10,6 +10,8 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import com.arthenica.ffmpegkit.FFmpegKit
@@ -22,15 +24,95 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/** Subtitled MP4 + Myanmar voice-over → Movies/Recap. Background thread ကနေ ခေါ်ပါ။ */
+/** ခန်းတစ်ခုချင်း render → ပေါင်း → Movies/Recap. Background thread ကနေ ခေါ်ပါ။ */
 object VideoExporter {
-    private data class VoiceTrack(val input: File, val startMs: Long, val speed: Double)
+    private class Plan(val dur: Double, val vSpeed: Double, val aSpeed: Double)
+    private class Cancelled : RuntimeException("Render ရပ်လိုက်ပါပြီ")
+
+    private const val MAX_AUDIO_SQUEEZE = 1.15
+    private const val MAX_AUDIO_HARD = 1.4
+    private const val MIN_VIDEO_SPEED = 0.75
 
     @Volatile private var lastStage = ""
+    @Volatile private var cancelled = false
 
     private fun stage(s: String) {
         lastStage = s
         Breadcrumb.mark(s)
+    }
+
+    private fun f3(v: Double) = String.format(Locale.US, "%.3f", v)
+
+    // Video speed ခလုတ်ရဲ့ တန်ဖိုးကို MainActivity ကနေ ဖတ် (မရရင် 1.3)
+    private fun readVideoSpeed(context: Context): Double = try {
+        val f = context.javaClass.getDeclaredField("videoSpeed")
+        f.isAccessible = true
+        f.getDouble(context).coerceIn(1.0, 2.0)
+    } catch (e: Throwable) {
+        1.3
+    }
+
+    // c = မူရင်း clip စက္ကန့်၊ t = အသံ စက္ကန့်၊ vs = video speed
+    private fun plan(c: Double, t: Double, vs: Double): Plan {
+        if (t <= 0.05) return Plan(c / vs, vs, 1.0)
+        val fast = c / vs
+        if (t <= fast) return Plan(fast, vs, 1.0)
+        if (t <= c) return Plan(t, c / t, 1.0)
+        var a = minOf(t / c, MAX_AUDIO_SQUEEZE)
+        var d = t / a
+        if (c / d < MIN_VIDEO_SPEED) {
+            d = c / MIN_VIDEO_SPEED
+            a = minOf(t / d, MAX_AUDIO_HARD)
+            d = t / a
+        }
+        return Plan(d, c / d, a)
+    }
+
+    private class RenderDialog(private val act: Activity?) {
+        private var dialog: AlertDialog? = null
+        private var msg: TextView? = null
+        private var bar: ProgressBar? = null
+
+        fun show(total: Int, onCancel: () -> Unit) {
+            val a = act ?: return
+            a.runOnUiThread {
+                try {
+                    val box = LinearLayout(a)
+                    box.orientation = LinearLayout.VERTICAL
+                    box.setPadding(48, 32, 48, 8)
+                    val t = TextView(a)
+                    t.textSize = 15f
+                    t.text = "စတင်နေပါတယ်..."
+                    val b = ProgressBar(a, null, android.R.attr.progressBarStyleHorizontal)
+                    b.max = total
+                    box.addView(t)
+                    box.addView(b)
+                    msg = t
+                    bar = b
+                    dialog = AlertDialog.Builder(a)
+                        .setTitle("Render လုပ်နေပါတယ်")
+                        .setView(box)
+                        .setCancelable(false)
+                        .setNegativeButton("ရပ်မယ်") { _, _ -> onCancel() }
+                        .show()
+                } catch (e: Throwable) { }
+            }
+        }
+
+        fun update(done: Int, total: Int, line: String) {
+            act?.runOnUiThread {
+                try {
+                    msg?.text = "ခန်း $done/$total ပြီးပြီ • ကျန် ${total - done}\n$line"
+                    bar?.progress = done
+                } catch (e: Throwable) { }
+            }
+        }
+
+        fun dismiss() {
+            act?.runOnUiThread {
+                try { dialog?.dismiss() } catch (e: Throwable) { }
+            }
+        }
     }
 
     fun export(
@@ -42,111 +124,151 @@ object VideoExporter {
         ttsSpeeds: DoubleArray
     ): Uri {
         lastStage = "စတင်နေ"
+        cancelled = false
         require(segments.isNotEmpty()) { "No video segments to export." }
-        require(translations.size == segments.size && ttsFiles.size == segments.size && ttsSpeeds.size == segments.size) {
+        require(translations.size == segments.size && ttsFiles.size == segments.size) {
             "Video data changed. Please try again."
         }
-
-        val voices = segments.indices.mapNotNull { i ->
+        fun voiceOf(i: Int): File? {
             val text = translations[i]
             val file = ttsFiles[i]
-            if (text.isNullOrBlank() || file == null || !file.isFile || file.length() <= 44L) null
-            else VoiceTrack(file, segments[i].startMs, ttsSpeeds[i].coerceIn(1.0, 2.0))
+            return if (text.isNullOrBlank() || file == null || !file.isFile || file.length() <= 44L) null
+            else file
         }
-        require(voices.isNotEmpty()) { "No generated voice-over audio. Generate TTS first." }
+        require(segments.indices.any { voiceOf(it) != null }) { "No generated voice-over audio. Generate TTS first." }
+
+        val vs = readVideoSpeed(context)
+        val total = segments.size
+        val ui = RenderDialog(context as? Activity)
 
         val cache = File(context.cacheDir, "recap_export").apply { mkdirs() }
+        cache.listFiles()?.forEach { if (it.isFile) it.delete() }
         val inputVideo = File(cache, "source.mp4")
-        val subtitleFile = File(cache, "captions.ass")
-        val videoPart = File(cache, "video_sub.mp4")
-        val audioPart = File(cache, "audio.m4a")
+        val listFile = File(cache, "scenes.txt")
         val outputVideo = File(cache, "rendered.mp4")
         val fontDir = File(cache, "fonts").apply { mkdirs() }
         val fontFile = File(fontDir, "NotoSansMyanmar.ttf")
+        val temps = ArrayList<File>()
 
         try {
-            stage("1/7 source video ကူးနေ")
+            ui.show(total) {
+                cancelled = true
+                try { FFmpegKit.cancel() } catch (e: Throwable) { }
+            }
+
+            stage("1 source video ကူးနေ")
+            ui.update(0, total, "Video ကူးနေပါတယ်...")
             context.contentResolver.openInputStream(source)?.use { input ->
                 FileOutputStream(inputVideo).use { output -> input.copyTo(output) }
             } ?: error("Cannot read the selected video.")
 
-            stage("2/7 font ကူးနေ (assets/fonts/NotoSansMyanmar.ttf)")
+            stage("2 font ကူးနေ (assets/fonts/NotoSansMyanmar.ttf)")
             copyBundledFont(context, fontFile)
             setFontDir(context, fontDir)
 
-            stage("3/7 caption ဖိုင်ရေးနေ")
-            val durationMs = segments.maxOf { it.endMs }
             val (width, height) = videoSize(inputVideo)
-            writeAss(subtitleFile, segments, translations, width, height)
-            val tSec = String.format(Locale.US, "%.3f", durationMs / 1000.0)
+            val minDim = minOf(width, height)
 
-            // ၁) video + subtitle (အသံမပါ)
-            videoPart.delete()
-            runFfmpeg(
-                "4/7 FFmpeg: video + subtitle",
-                listOf(
+            val scenes = ArrayList<File>()
+            for (i in 0 until total) {
+                if (cancelled) throw Cancelled()
+                val seg = segments[i]
+                val c = (seg.endMs - seg.startMs) / 1000.0
+                if (c <= 0.05) continue
+                val voice = voiceOf(i)
+                val t = if (voice != null) durationOf(voice) / 1000.0 else 0.0
+                val p = plan(c, t, vs)
+
+                stage("ခန်း ${i + 1}/$total render")
+                ui.update(scenes.size, total, "ခန်း ${i + 1} render နေပါတယ်...")
+
+                val ass = File(cache, "scene_${i}.ass")
+                val scene = File(cache, "scene_${i}.mp4")
+                temps.add(ass)
+                temps.add(scene)
+                writeAssScene(ass, translations[i]?.trim().orEmpty(), p.dur, width, height)
+
+                val args = mutableListOf(
                     "-hide_banner", "-loglevel", "error", "-y",
-                    "-i", inputVideo.absolutePath,
-                    "-an",
-                    "-vf", subtitleFilter(subtitleFile, fontDir, minOf(width, height)),
-                    "-t", tSec,
-                    "-c:v", "mpeg4", "-q:v", "4", "-threads", "2",
-                    videoPart.absolutePath
-                ),
-                videoPart
-            )
-
-            // ၂) မြန်မာအသံတွေ ပေါင်း
-            audioPart.delete()
-            val audioArgs = mutableListOf("-hide_banner", "-loglevel", "error", "-y")
-            voices.forEach { audioArgs.addAll(listOf("-i", it.input.absolutePath)) }
-            audioArgs.addAll(
-                listOf(
-                    "-filter_complex", buildAudioGraph(voices),
-                    "-map", "[aout]",
-                    "-t", tSec,
-                    "-c:a", "aac", "-b:a", "128k",
-                    audioPart.absolutePath
+                    "-ss", f3(seg.startMs / 1000.0), "-t", f3(c),
+                    "-i", inputVideo.absolutePath
                 )
-            )
-            runFfmpeg("5/7 FFmpeg: audio mix", audioArgs, audioPart)
+                if (voice != null) {
+                    args.addAll(listOf("-i", voice.absolutePath))
+                } else {
+                    args.addAll(listOf("-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono"))
+                }
+                val af = if (voice != null)
+                    "atempo=${f3(p.aSpeed)},aformat=sample_rates=48000:channel_layouts=mono,apad=whole_dur=${f3(p.dur)}"
+                else
+                    "aformat=sample_rates=48000:channel_layouts=mono"
+                args.addAll(
+                    listOf(
+                        "-map", "0:v:0", "-map", "1:a:0",
+                        "-vf", "setpts=(PTS-STARTPTS)/${f3(p.vSpeed)},fps=30," + subtitleFilter(ass, fontDir, minDim),
+                        "-af", af,
+                        "-t", f3(p.dur),
+                        "-c:v", "mpeg4", "-q:v", "4", "-pix_fmt", "yuv420p", "-threads", "2",
+                        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "1",
+                        scene.absolutePath
+                    )
+                )
+                runFfmpeg("ခန်း ${i + 1}/$total", args, scene)
+                scenes.add(scene)
+                ui.update(scenes.size, total, "ခန်း ${i + 1} ပြီးပါပြီ")
+            }
+            require(scenes.isNotEmpty()) { "Render လုပ်စရာ ခန်းမရှိပါ။" }
 
-            // ၃) video + audio ပေါင်း (re-encode မလုပ်)
+            if (cancelled) throw Cancelled()
+            ui.update(scenes.size, total, "ခန်းတွေကို ပေါင်းနေပါတယ်...")
+            listFile.writeText(
+                scenes.joinToString("\n") { "file '" + it.absolutePath.replace("'", "'\\''") + "'" }
+            )
             outputVideo.delete()
             runFfmpeg(
-                "6/7 FFmpeg: mux",
+                "ပေါင်းနေ",
                 listOf(
                     "-hide_banner", "-loglevel", "error", "-y",
-                    "-i", videoPart.absolutePath,
-                    "-i", audioPart.absolutePath,
-                    "-map", "0:v:0", "-map", "1:a:0",
-                    "-c", "copy",
-                    "-movflags", "+faststart",
+                    "-f", "concat", "-safe", "0", "-i", listFile.absolutePath,
+                    "-c", "copy", "-movflags", "+faststart",
                     outputVideo.absolutePath
                 ),
                 outputVideo
             )
 
-            stage("7/7 gallery ထဲ save နေ")
+            stage("gallery ထဲ save နေ")
+            ui.update(scenes.size, total, "Gallery ထဲ သိမ်းနေပါတယ်...")
             val uri = saveToGallery(context, outputVideo)
             Breadcrumb.clear()
+            ui.dismiss()
             return uri
         } catch (t: Throwable) {
             val st = lastStage
             Breadcrumb.clear()
-            showError(context, st, t)
+            ui.dismiss()
+            if (t !is Cancelled) showError(context, st, t)
             throw t
         } finally {
             inputVideo.delete()
-            subtitleFile.delete()
-            videoPart.delete()
-            audioPart.delete()
+            listFile.delete()
             outputVideo.delete()
             fontFile.delete()
+            temps.forEach { it.delete() }
         }
     }
 
-    // Error အပြည့်ကို dialog နဲ့ ပြ (Toast က စာတိုတိုပဲ ပြလို့)
+    private fun durationOf(f: File): Long {
+        val r = MediaMetadataRetriever()
+        return try {
+            r.setDataSource(f.absolutePath)
+            r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        } catch (e: Exception) {
+            0L
+        } finally {
+            r.release()
+        }
+    }
+
     private fun showError(context: Context, st: String, t: Throwable) {
         val a = context as? Activity ?: return
         val sw = StringWriter()
@@ -179,7 +301,6 @@ object VideoExporter {
         }
     }
 
-    // FFmpegKitConfig.setFontDirectory ကို reflection နဲ့ ခေါ် (library fork မှာ မရှိလည်း build မပျက်အောင်)
     private fun setFontDir(context: Context, dir: File) {
         try {
             val c = Class.forName("com.arthenica.ffmpegkit.FFmpegKitConfig")
@@ -194,6 +315,7 @@ object VideoExporter {
     private fun runFfmpeg(st: String, args: List<String>, out: File) {
         stage(st)
         val session = FFmpegKit.executeWithArguments(args.toTypedArray())
+        if (cancelled) throw Cancelled()
         if (!ReturnCode.isSuccess(session.returnCode) || !out.isFile || out.length() < 1024L) {
             val details = session.output.orEmpty().takeLast(1800)
             throw IllegalStateException("[$st] " + details.ifBlank { "FFmpeg မအောင်မြင်ပါ" })
@@ -212,25 +334,8 @@ object VideoExporter {
         }
     }
 
-    private fun buildAudioGraph(voices: List<VoiceTrack>): String {
-        val parts = ArrayList<String>()
-        voices.forEachIndexed { i, track ->
-            val delay = track.startMs.coerceAtLeast(0L)
-            val speed = String.format(Locale.US, "%.3f", track.speed)
-            parts.add("[$i:a]aresample=48000,atempo=$speed,adelay=delays=$delay:all=1[a$i]")
-        }
-        val inputs = voices.indices.joinToString(separator = "") { "[a$it]" }
-        parts.add("${inputs}amix=inputs=${voices.size}:duration=longest:normalize=0:dropout_transition=0,alimiter=limit=0.95[aout]")
-        return parts.joinToString(";")
-    }
-
-    private fun writeAss(
-        target: File,
-        segments: List<Segment>,
-        translations: Array<String?>,
-        width: Int,
-        height: Int
-    ) {
+    // ခန်းတစ်ခုအတွက် caption ဖိုင် (ခန်းစကတည်းက ခန်းအဆုံးထိ ပြ)
+    private fun writeAssScene(target: File, caption: String, durSec: Double, width: Int, height: Int) {
         val fontSize = (minOf(width, height) * 0.052).toInt().coerceIn(28, 68)
         val marginV = (height * 0.045).toInt().coerceAtLeast(24)
         val content = buildString {
@@ -247,18 +352,15 @@ object VideoExporter {
             appendLine()
             appendLine("[Events]")
             appendLine("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
-            segments.forEachIndexed { i, segment ->
-                val caption = translations[i]?.trim().orEmpty()
-                if (caption.isNotEmpty() && segment.endMs > segment.startMs) {
-                    val escaped = caption
-                        .replace("\\", "\\\\")
-                        .replace("{", "\\{")
-                        .replace("}", "\\}")
-                        .replace("\r\n", "\n")
-                        .replace('\r', '\n')
-                        .replace("\n", "\\N")
-                    appendLine("Dialogue: 0,${assTime(segment.startMs)},${assTime(segment.endMs)},Default,,0,0,0,,$escaped")
-                }
+            if (caption.isNotEmpty()) {
+                val escaped = caption
+                    .replace("\\", "\\\\")
+                    .replace("{", "\\{")
+                    .replace("}", "\\}")
+                    .replace("\r\n", "\n")
+                    .replace('\r', '\n')
+                    .replace("\n", "\\N")
+                appendLine("Dialogue: 0,${assTime(0)},${assTime(((durSec + 0.5) * 1000).toLong())},Default,,0,0,0,,$escaped")
             }
         }
         target.writeText(content, Charsets.UTF_8)
