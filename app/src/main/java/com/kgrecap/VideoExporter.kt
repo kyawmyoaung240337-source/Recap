@@ -138,6 +138,7 @@ object VideoExporter {
         require(segments.indices.any { voiceOf(it) != null }) { "No generated voice-over audio. Generate TTS first." }
 
         val vs = readVideoSpeed(context)
+        val gain = RenderSettings.voiceGain.coerceIn(0.5, 6.0)
         val total = segments.size
         val ui = RenderDialog(context as? Activity)
 
@@ -198,8 +199,10 @@ object VideoExporter {
                 } else {
                     args.addAll(listOf("-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono"))
                 }
+                // အသံ: speed ညှိ → volume မြှင့် → peak မကျော်အောင် limiter → ခန်းအရှည်အထိ တိတ်ဆိတ်ဖြည့်
                 val af = if (voice != null)
-                    "atempo=${f3(p.aSpeed)},aformat=sample_rates=48000:channel_layouts=mono,apad=whole_dur=${f3(p.dur)}"
+                    "atempo=${f3(p.aSpeed)},volume=${f3(gain)},alimiter=limit=0.95:level=0," +
+                        "aformat=sample_rates=48000:channel_layouts=mono,apad=whole_dur=${f3(p.dur)}"
                 else
                     "aformat=sample_rates=48000:channel_layouts=mono"
                 args.addAll(
