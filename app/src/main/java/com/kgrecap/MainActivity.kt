@@ -14,6 +14,7 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.media.PlaybackParams
+import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.Bundle
 import android.os.Build
@@ -36,7 +37,6 @@ import android.widget.VideoView
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
-import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
@@ -52,27 +52,26 @@ class MainActivity : Activity() {
     private val pickCode = 1
     private val exportPermissionCode = 4
     private val videoHeightRatio = 0.36
+    private val transcribeWorkers = 3
 
     private val videoOpts = doubleArrayOf(1.1, 1.3, 1.5)
     private val voiceOpts = doubleArrayOf(1.0, 1.1, 1.2, 1.3)
+    private val gainOpts = doubleArrayOf(1.0, 1.5, 2.0, 3.0, 4.0)
     private val pauseOpts = doubleArrayOf(0.6, 1.0, 1.5)
     private val pauseNames = arrayOf("နည်း", "ပုံမှန်", "များ")
-    private val maxExtra = 1.15
     private val sylPerSec = 4.5
     private var videoSpeed = 1.3
     private var voiceSpeed = 1.2
+    private var voiceGain = 2.0
     private var pauseIdx = 1
     private var voiceIdx = 0
     private var customVoice = ""
-
-    private val gainOpts = doubleArrayOf(1.0, 1.5, 2.0, 3.0, 4.0)
-    private var voiceGain = 2.0
 
     private lateinit var list: ListView
     private lateinit var video: VideoView
     private lateinit var adapter: ArrayAdapter<String>
     private lateinit var btnKey: Button
-    private lateinit var btnGain: Button
+    private lateinit var keyStatus: TextView
     private lateinit var btnRun: Button
     private lateinit var btnCopy: Button
     private lateinit var btnPaste: Button
@@ -81,6 +80,7 @@ class MainActivity : Activity() {
     private lateinit var btnVoiceId: Button
     private lateinit var btnPause: Button
     private lateinit var btnSample: Button
+    private lateinit var btnGain: Button
     private lateinit var btnExport: Button
     private lateinit var sec0: Button
     private lateinit var sec1: Button
@@ -112,7 +112,7 @@ class MainActivity : Activity() {
     @Volatile private var ttsStop = false
     private var sampling = false
     private var ttsPlayer: MediaPlayer? = null
-    private var ttsEnhancer: android.media.audiofx.LoudnessEnhancer? = null
+    private var enhancer: LoudnessEnhancer? = null
     private var sourceVideoUri: Uri? = null
     @Volatile private var exporting = false
 
@@ -165,6 +165,7 @@ class MainActivity : Activity() {
         actionBar?.hide()
         val dm = resources.displayMetrics
         val videoH = (dm.heightPixels * videoHeightRatio).toInt()
+        voiceGain = getSharedPreferences("kgrecap", MODE_PRIVATE).getFloat("gain", 2.0f).toDouble()
 
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
@@ -180,22 +181,38 @@ class MainActivity : Activity() {
                 Gravity.CENTER
             )
         )
-        val dpi = resources.displayMetrics.density
+        // 🔑 ခလုတ်: ဗီဒီယိုရဲ့ ညာအပေါ်ထောင့်
         btnKey = Button(this)
         btnKey.text = "🔑"
         btnKey.textSize = 16f
-        btnKey.setPadding(0, 0, 0, 0)
-        btnKey.setOnClickListener { showKeyDialog() }
-        val keyLp = FrameLayout.LayoutParams((44 * dpi).toInt(), (44 * dpi).toInt(), Gravity.TOP or Gravity.END)
-        keyLp.setMargins(0, (8 * dpi).toInt(), (8 * dpi).toInt(), 0)
-        box.addView(btnKey, keyLp)
+        btnKey.isAllCaps = false
+        btnKey.minWidth = 0
+        btnKey.minimumWidth = 0
+        btnKey.setPadding(28, 8, 28, 8)
+        btnKey.setOnClickListener {
+            Keys.showDialog(this) {
+                updateKeyButton()
+                updateProgress()
+            }
+        }
+        val klp = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.END
+        )
+        klp.setMargins(0, 16, 16, 0)
+        box.addView(btnKey, klp)
         root.addView(box, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, videoH))
 
         val btnPick = button("Video ရွေးပါ") { pickVideo() }
 
         // ----- စာထုတ် panel -----
+        keyStatus = TextView(this)
+        keyStatus.textSize = 12f
+        keyStatus.setPadding(8, 8, 8, 8)
         btnRun = button("") { onRun() }
         panel0 = vbox()
+        panel0.addView(keyStatus)
         panel0.addView(btnRun)
 
         // ----- ဘာသာပြန် panel -----
@@ -256,7 +273,6 @@ class MainActivity : Activity() {
         }
         root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
-        RenderSettings.voiceGain = voiceGain
         setContentView(root)
         updateButtons()
         applyPanels()
@@ -285,7 +301,7 @@ class MainActivity : Activity() {
         sec2.text = (if (openPanel == 2) "▾ " else "") + "အသံ" + (if (tr > 0) " ${nTts()}/$tr" else "")
     }
 
-    // ---------------- Speed / Voice ----------------
+    // ---------------- Speed / Voice / Volume ----------------
 
     private fun cycleVideoSpeed() {
         val i = videoOpts.indexOfFirst { Math.abs(it - videoSpeed) < 0.001 }
@@ -303,6 +319,14 @@ class MainActivity : Activity() {
         voiceSpeed = voiceOpts[(i + 1) % voiceOpts.size]
         updateSpeedButtons()
         invalidateTts()
+    }
+
+    private fun cycleGain() {
+        val i = gainOpts.indexOfFirst { Math.abs(it - voiceGain) < 0.001 }
+        voiceGain = gainOpts[(i + 1) % gainOpts.size]
+        getSharedPreferences("kgrecap", MODE_PRIVATE).edit().putFloat("gain", voiceGain.toFloat()).apply()
+        updateVoiceButtons()
+        Toast.makeText(this, "Volume ပြောင်းရင် TTS ပြန်ထုတ်စရာ မလိုပါ။ ▶ နမူနာနဲ့ Render မှာ ကျပါမယ်", Toast.LENGTH_SHORT).show()
     }
 
     private fun cyclePause() {
@@ -357,87 +381,9 @@ class MainActivity : Activity() {
         btnVoice.text = "Voice: " +
             (if (voiceIdx < EdgeTts.presets.size) EdgeTts.presets[voiceIdx].label else "Custom")
         btnPause.text = "နားချိန်: " + pauseNames[pauseIdx]
-        btnGain.text = "Voice volume: ${Math.round(voiceGain * 100)}%"
+        btnGain.text = String.format(Locale.US, "Volume: %.1fx", voiceGain)
     }
 
-    // အသံ volume (render + နားထောင်ကြည့်တာ) — TTS ပြန်ထုတ်စရာ မလို
-    private fun cycleGain() {
-        val i = gainOpts.indexOfFirst { Math.abs(it - voiceGain) < 0.001 }
-        voiceGain = gainOpts[(i + 1) % gainOpts.size]
-        RenderSettings.voiceGain = voiceGain
-        updateVoiceButtons()
-        Toast.makeText(this, "Volume ${Math.round(voiceGain * 100)}% — ▶ နမူနာနဲ့ နားထောင်ကြည့်ပါ", Toast.LENGTH_SHORT).show()
-    }
-
-    // ---------------- API key ----------------
-
-    private fun updateKeyButton() {
-        if (!::btnKey.isInitialized) return
-        val ok = KeyStore.get(this, KeyStore.DEEPGRAM).isNotBlank()
-        val bg = android.graphics.drawable.GradientDrawable()
-        bg.shape = android.graphics.drawable.GradientDrawable.OVAL
-        bg.setColor(Color.parseColor(if (ok) "#CC2E7D32" else "#CCC62828"))
-        btnKey.background = bg
-    }
-
-    private fun showKeyDialog() {
-        val dp = resources.displayMetrics.density
-        val saved = KeyStore.get(this, KeyStore.DEEPGRAM)
-        val box = LinearLayout(this)
-        box.orientation = LinearLayout.VERTICAL
-        box.setPadding((20 * dp).toInt(), (12 * dp).toInt(), (20 * dp).toInt(), 0)
-        val label = TextView(this)
-        label.text = "Deepgram API key (စာထုတ်ဖို့)"
-        val input = EditText(this)
-        input.setSingleLine(true)
-        input.hint = if (saved.isNotEmpty()) "လက်ရှိ: " + KeyStore.mask(saved) else "Key ကို ဒီမှာ paste လုပ်ပါ"
-        val status = TextView(this)
-        status.textSize = 13f
-        status.setPadding(0, (8 * dp).toInt(), 0, 0)
-        status.text = if (saved.isNotEmpty()) "✓ Key သိမ်းထားပြီး" else "Key မထည့်ရသေးပါ"
-        box.addView(label)
-        box.addView(input)
-        box.addView(status)
-        val dlg = AlertDialog.Builder(this)
-            .setTitle("🔑 API Keys")
-            .setView(box)
-            .setPositiveButton("Save", null)
-            .setNeutralButton("ဖျက်မယ်") { _, _ ->
-                KeyStore.set(this@MainActivity, KeyStore.DEEPGRAM, "")
-                updateKeyButton()
-                updateProgress()
-            }
-            .setNegativeButton("Close", null)
-            .create()
-        dlg.show()
-        val save = dlg.getButton(AlertDialog.BUTTON_POSITIVE)
-        save.setOnClickListener {
-            val key = input.text.toString().trim()
-            if (key.isEmpty()) {
-                status.text = "Key ရိုက်ထည့်ပါ"
-                return@setOnClickListener
-            }
-            save.isEnabled = false
-            status.text = "Key ကို စစ်နေပါတယ်..."
-            Thread {
-                val r = Deepgram.validate(key)
-                runOnUiThread {
-                    save.isEnabled = true
-                    if (r.ok) {
-                        KeyStore.set(this@MainActivity, KeyStore.DEEPGRAM, key)
-                        updateKeyButton()
-                        updateProgress()
-                        Toast.makeText(this@MainActivity, "✓ Key အလုပ်လုပ်ပါတယ်၊ သိမ်းပြီးပါပြီ", Toast.LENGTH_LONG).show()
-                        dlg.dismiss()
-                    } else {
-                        status.text = "✗ " + r.message + "\n(Key ကို မသိမ်းပါ)"
-                    }
-                }
-            }.start()
-        }
-    }
-
-    // အသံ setting ပြောင်းရင် ထုတ်ပြီးသား အသံတွေ ပျက်ပြီ
     private fun invalidateTts() {
         val any = ttsMs.any { it > 0L }
         for (i in ttsMs.indices) ttsMs[i] = 0L
@@ -468,6 +414,16 @@ class MainActivity : Activity() {
         updateProgress()
     }
 
+    private fun updateKeyButton() {
+        if (!::btnKey.isInitialized || !::keyStatus.isInitialized) return
+        val key = Keys.deepgram(this)
+        val has = key.isNotBlank()
+        btnKey.setBackgroundColor(if (has) 0xCC2E7D32.toInt() else 0xCCC62828.toInt())
+        btnKey.setTextColor(Color.WHITE)
+        keyStatus.text = if (has) "Deepgram key: ✓ ${Keys.mask(key)}"
+        else "Deepgram key မရှိသေးပါ — ညာအပေါ်ထောင့်က 🔑 ကိုနှိပ်ပါ"
+    }
+
     private fun updateProgress() {
         updateRunButton()
         updatePasteButton()
@@ -491,15 +447,16 @@ class MainActivity : Activity() {
     }
 
     private fun updateRunButton() {
+        if (!::btnRun.isInitialized) return
         val n = texts.size
         val d = nDone()
         btnRun.text = when {
             analyzing -> "အသံစစ်နေပါတယ်..."
             running && stopReq -> "ရပ်နေပါတယ်... $d/$n"
             running -> "စာထုတ်နေ $d/$n (ကျန် ${n - d}) • ရပ်မယ်"
+            Keys.deepgram(this).isBlank() -> "Transcribe (🔑 key ထည့်ပါ)"
             n == 0 -> "Transcribe (Video ရွေးပါ)"
-            KeyStore.get(this, KeyStore.DEEPGRAM).isBlank() -> "🔑 Deepgram key အရင်ထည့်ပါ"
-            d == 0 -> "Transcribe စတင်မယ် (Deepgram)"
+            d == 0 -> "Transcribe စတင်မယ်"
             d < n -> "ဆက်လုပ်မယ် $d/$n (ကျန် ${n - d})"
             else -> "စာထုတ်ပြီး $d/$n ✓"
         }
@@ -523,7 +480,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------------- Deepgram (စာထုတ်) ----------------
+    // ---------------- Transcribe (Deepgram) ----------------
 
     private fun onRun() {
         if (analyzing) return
@@ -532,19 +489,22 @@ class MainActivity : Activity() {
             updateRunButton()
             return
         }
-        startTranscribe()
+        val key = Keys.deepgram(this)
+        if (key.isBlank()) {
+            Toast.makeText(this, "Deepgram API key ထည့်ပါ (ညာအပေါ်ထောင့်က 🔑)", Toast.LENGTH_LONG).show()
+            Keys.showDialog(this) {
+                updateKeyButton()
+                updateProgress()
+            }
+            return
+        }
+        startTranscribe(key)
     }
 
-    private fun startTranscribe() {
+    private fun startTranscribe(key: String) {
         val pcm = pcmFile
         if (pcm == null || segments.isEmpty()) {
             Toast.makeText(this, "Video ရွေးပြီး အသံစစ်တာ ပြီးမှ လုပ်ပါ", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val key = KeyStore.get(this, KeyStore.DEEPGRAM)
-        if (key.isBlank()) {
-            Toast.makeText(this, "🔑 Deepgram key အရင်ထည့်ပါ", Toast.LENGTH_SHORT).show()
-            showKeyDialog()
             return
         }
         running = true
@@ -553,44 +513,47 @@ class MainActivity : Activity() {
         val id = loadId
         val segs = segments
         val tx = texts
+        val n = transcribeWorkers
         val next = AtomicInteger(0)
         val finished = AtomicInteger(0)
-        val errRef = AtomicReference<String?>(null)
-        val authFail = java.util.concurrent.atomic.AtomicBoolean(false)
-        val nThreads = 3
+        val errRef = AtomicReference<DeepgramException?>(null)
 
-        for (k in 0 until nThreads) {
+        for (k in 0 until n) {
             Thread {
                 while (!stopReq && id == loadId && errRef.get() == null) {
                     val i = next.getAndIncrement()
                     if (i >= segs.size) break
                     if (tx[i] != null) continue
                     try {
-                        val raw = readPcmBytes(pcm, segs[i])
-                        val text = if (raw.size < 3200) ""
-                        else Deepgram.transcribe(key, Deepgram.wavOf(raw)).trim()
+                        val bytes = readPcmBytes(pcm, segs[i])
+                        val text = if (bytes.size < 3200) ""
+                        else Deepgram.transcribe(key, Deepgram.wav(bytes))
                         runOnUiThread {
                             if (id == loadId) {
                                 tx[i] = text
                                 refreshLabel(i)
                             }
                         }
-                    } catch (e: Deepgram.ApiError) {
-                        if (e.code == 401 || e.code == 403) authFail.set(true)
-                        errRef.compareAndSet(null, e.message ?: "Deepgram error")
-                    } catch (e: Exception) {
-                        errRef.compareAndSet(null, e.message ?: e.toString())
+                    } catch (e: DeepgramException) {
+                        errRef.compareAndSet(null, e)
+                    } catch (e: Throwable) {
+                        errRef.compareAndSet(null, DeepgramException(-3, e.message ?: e.toString()))
                     }
                 }
-                if (finished.incrementAndGet() == nThreads) {
+                if (finished.incrementAndGet() == n) {
                     runOnUiThread {
                         running = false
                         stopReq = false
                         updateRunButton()
                         val e = errRef.get()
                         if (e != null) {
-                            Toast.makeText(this@MainActivity, e, Toast.LENGTH_LONG).show()
-                            if (authFail.get()) showKeyDialog()
+                            Toast.makeText(this@MainActivity, "Transcribe error: ${e.message}", Toast.LENGTH_LONG).show()
+                            if (e.code == 401 || e.code == 403) {
+                                Keys.showDialog(this@MainActivity) {
+                                    updateKeyButton()
+                                    updateProgress()
+                                }
+                            }
                         }
                     }
                 }
@@ -616,25 +579,19 @@ class MainActivity : Activity() {
 
     private fun clipSec(i: Int) = (segments[i].endMs - segments[i].startMs) / 1000.0
 
-    // video speed အရ ပြောခွင့်ရတဲ့ အချိန်
+    // Gemini ကို ပေးမယ့် အချိန်ကန့်သတ်ချက် (video speed အရ ပြောခွင့်ရတဲ့ အချိန်)
     private fun slotSec(i: Int) = clipSec(i) / videoSpeed
 
-    // ထုတ်ပြီးသား အသံက အချိန်ထက်ရှည်ရင် ထပ်မြှင့်ရမယ့် speed (အများဆုံး maxExtra)
-    private fun audioSpeedOf(i: Int): Double {
-        val e = slotSec(i)
-        val t = ttsMs[i] / 1000.0
-        return if (e > 0.0 && t > e) minOf(t / e, maxExtra) else 1.0
-    }
+    private fun planOf(i: Int): ScenePlan = planScene(clipSec(i), ttsMs[i] / 1000.0, videoSpeed)
 
     private fun plan(i: Int): String {
         val c = clipSec(i)
-        val e = slotSec(i)
         val t = ttsMs[i] / 1000.0
-        val a = audioSpeedOf(i)
-        val flag = if (t / a > e + 0.05) "  ⚠ စာရှည်နေသေး (တိုပါ)" else ""
+        val p = planOf(i)
+        val flag = if (p.vSpeed < 0.749) "  ⚠ စာရှည်နေသေး (တိုပါ)" else ""
         return String.format(
-            Locale.US, "🔊 %.1fs | video %.1fs→%.1fs (%.1fx) | အသံ ထပ်မြှင့် %.2fx→%.1fs%s",
-            t, c, e, videoSpeed, a, t / a, flag
+            Locale.US, "🔊 %.1fs | video %.1fs→%.1fs (%.2fx) | အသံ %.2fx%s",
+            t, c, p.dur, p.vSpeed, p.aSpeed, flag
         )
     }
 
@@ -663,15 +620,6 @@ class MainActivity : Activity() {
         for (i in labels.indices) labels[i] = label(i)
         adapter.notifyDataSetChanged()
         updateProgress()
-    }
-
-    private fun clearTexts() {
-        for (i in texts.indices) {
-            texts[i] = null
-            trans[i] = null
-        }
-        for (i in ttsMs.indices) ttsMs[i] = 0L
-        refreshAll()
     }
 
     private fun mmss(ms: Long): String {
@@ -707,16 +655,15 @@ Text-to-speech rules (everything you write will be spoken aloud):
 13. Do not add words such as ရှင်, ရှင့်, ခင်ဗျာ, ဗျာ, ကွယ်, နော် (gender or politeness endings). Write neutral plain spoken sentences.
 14. Do not add any word that is not part of the original meaning.
 
-Character dialogue rules (မဖြစ်မနေ လိုက်နာရန်):
-15. သဘာဝကျကျ စကားပြောဟန် ဖြစ်ရမည်: မှတ်တမ်းရုပ်ရှင် ဇာတ်ကြောင်းပြော (Narrator) သို့မဟုတ် အကျဉ်းချုပ်ပြောသလိုမျိုး မဟုတ်ဘဲ၊ ဇာတ်ကောင်တွေ အမှန်တကယ် ပြောဆိုနေကြသကဲ့သို့ သဘာဝကျပြီး ဒရမ်မာဆန်သော စကားပြောဟန် (Dramatic Character Dialogue) ဖြစ်ရပါမယ်။
-16. အချိတ်အဆက် မိရမည်: အပိုင်းတစ်ပိုင်းနဲ့ တစ်ပိုင်း (Turns) အကြား ခံစားချက်၊ စကားအပြန်အလှန် အချိတ်အဆက်နဲ့ စီးဆင်းမှု မပြတ်တောက်ဘဲ သဘာဝကျရပါမယ်။ ဒါပေမဲ့ အပိုင်းတစ်ခုရဲ့ စာကို နောက်အပိုင်းထဲ မရောရ။
-17. လုံးဝ ရောနှောခြင်း မပြုရ:
-   - မြန်မာစာ သက်သက်သာ ဖြစ်ရမည်: အင်္ဂလိပ်စာလုံး လုံးဝ မပါရပါ။ အင်္ဂလိပ် စကားလုံးများကို မြန်မာအသံထွက်ဖြင့် မြန်မာစာလုံးပေါင်းဖြင့်သာ ရေးသားရပါမယ်။
-   - သန့်စင်သော ဇာတ်ညွှန်း စာသား ဖြစ်ရမည် (Clean Output):
-     • Markdown ခေါင်းစဉ်များ (##)၊ စာသားအထူ (**)၊ စာသားစောင်း (*) လုံးဝ မပါရပါ။
-     • Man:၊ Woman: ကဲ့သို့သော ပြောသူအမည် တဂ်များ မပါရပါ။
-     • အမူအရာပြ ကွင်းစကွင်းပိတ်များ ((angrily) ကဲ့သို့သော စာသားများ) မပါရပါ။
-     • နှုတ်ခွန်းဆက်စကား သို့မဟုတ် အပိုစကားများ လုံးဝ မပါရပါ။"""
+[ဇာတ်ကောင်စကားပြော စည်းကမ်းများ — မဖြစ်မနေ လိုက်နာရန်]
+၁။ သဘာဝကျကျ စကားပြောဟန် ဖြစ်ရမည်: မှတ်တမ်းရုပ်ရှင် ဇာတ်ကြောင်းပြော (Narrator) သို့မဟုတ် အကျဉ်းချုပ်ပြောသလိုမျိုး မဟုတ်ဘဲ၊ ဇာတ်ကောင်တွေ အမှန်တကယ် ပြောဆိုနေကြသကဲ့သို့ သဘာဝကျပြီး ဒရမ်မာဆန်သော စကားပြောဟန် (Dramatic Character Dialogue) ဖြစ်ရပါမယ်။
+၂။ အချိတ်အဆက် မိရမည်: အပိုင်းတစ်ပိုင်းနဲ့ တစ်ပိုင်း (Turns) အကြား ခံစားချက်၊ စကားအပြန်အလှန် အချိတ်အဆက်နဲ့ စီးဆင်းမှု မပြတ်တောက်ဘဲ သဘာဝကျရပါမယ်။
+၃။ လုံးဝ ရောနှောခြင်း မပြုရ: မြန်မာစာ သက်သက်သာ ဖြစ်ရမည်။ အင်္ဂလိပ်စာလုံး လုံးဝ မပါရပါ။ အင်္ဂလိပ် စကားလုံးများကို မြန်မာအသံထွက်ဖြင့် မြန်မာစာလုံးပေါင်းဖြင့်သာ ရေးသားရပါမယ်။
+၄။ သန့်စင်သော ဇာတ်ညွှန်း စာသား ဖြစ်ရမည် (Clean Output):
+- Markdown ခေါင်းစဉ်များ (##)၊ စာသားအထူ (**)၊ စာသားစောင်း (*) လုံးဝ မပါရပါ။
+- Man:၊ Woman: ကဲ့သို့သော ပြောသူအမည် တဂ်များ မပါရပါ။
+- အမူအရာပြ ကွင်းစကွင်းပိတ်များ ((angrily) ကဲ့သို့သော စာသားများ) မပါရပါ။
+- နှုတ်ခွန်းဆက်စကား သို့မဟုတ် အပိုစကားများ လုံးဝ မပါရပါ။"""
     }
 
     private fun copyAll() {
@@ -791,7 +738,7 @@ Character dialogue rules (မဖြစ်မနေ လိုက်နာရန�
         box.orientation = LinearLayout.VERTICAL
         box.setPadding(40, 20, 40, 0)
         val l1 = TextView(this)
-        l1.text = "မူရင်းစာ"
+        l1.text = "မူရင်းစာ (Deepgram)"
         val e1 = EditText(this)
         e1.setText(texts[i] ?: "")
         val l2 = TextView(this)
@@ -825,33 +772,34 @@ Character dialogue rules (မဖြစ်မနေ လိုက်နာရန�
 
     private fun ttsFile(i: Int) = File(cacheDir, "tts_${segments[i].index}.wav")
 
+    private fun releasePlayer() {
+        try { enhancer?.release() } catch (e: Throwable) { }
+        enhancer = null
+        try { ttsPlayer?.release() } catch (e: Throwable) { }
+        ttsPlayer = null
+    }
+
     private fun playFile(f: File, speed: Double) {
         if (!f.exists()) return
-        ttsPlayer?.release()
-        try { ttsEnhancer?.release() } catch (e: Throwable) { }
-        ttsEnhancer = null
+        releasePlayer()
         val p = MediaPlayer()
         try {
             p.setDataSource(f.absolutePath)
             p.prepare()
-            p.setOnCompletionListener {
-                try { ttsEnhancer?.release() } catch (e: Throwable) { }
-                ttsEnhancer = null
-                it.release()
+            // Volume ကို မြှင့် (MediaPlayer.setVolume က 1.0 ထက် မကျော်နိုင်လို့)
+            if (voiceGain > 1.001) {
+                try {
+                    val e = LoudnessEnhancer(p.audioSessionId)
+                    e.setTargetGain((2000.0 * log10(voiceGain)).toInt())
+                    e.enabled = true
+                    enhancer = e
+                } catch (x: Throwable) { }
             }
+            p.setOnCompletionListener { releasePlayer() }
             if (speed > 1.001) {
                 try {
                     p.playbackParams = PlaybackParams().setSpeed(speed.toFloat()).setPitch(1.0f)
                 } catch (e: Exception) { }
-            }
-            // Volume ကို 100% ထက် မြှင့်ဖို့ (နားထောင်ကြည့်တာအတွက်)
-            if (voiceGain > 1.001) {
-                try {
-                    val le = android.media.audiofx.LoudnessEnhancer(p.audioSessionId)
-                    le.setTargetGain((20.0 * Math.log10(voiceGain) * 100.0).toInt())
-                    le.enabled = true
-                    ttsEnhancer = le
-                } catch (e: Throwable) { }
             }
             if (!p.isPlaying) p.start()
             ttsPlayer = p
@@ -865,7 +813,7 @@ Character dialogue rules (မဖြစ်မနေ လိုက်နာရန�
             Toast.makeText(this, "အသံ မထုတ်ရသေးပါ", Toast.LENGTH_SHORT).show()
             return
         }
-        playFile(ttsFile(i), audioSpeedOf(i))
+        playFile(ttsFile(i), planOf(i).aSpeed)
     }
 
     private fun playSample() {
@@ -979,6 +927,8 @@ Character dialogue rules (မဖြစ်မနေ လိုက်နာရန�
         }
     }
 
+    // ---------------- Render ----------------
+
     private fun onExport() {
         if (exporting) return
         val source = sourceVideoUri
@@ -1020,13 +970,15 @@ Character dialogue rules (မဖြစ်မနေ လိုက်နာရန�
         val fileSnapshot = segments.indices.map { i ->
             if (textSnapshot[i].isNullOrBlank()) null else ttsFile(i)
         }
-        val speedSnapshot = DoubleArray(segments.size) { i -> audioSpeedOf(i) }
+        val vsSnapshot = videoSpeed
+        val gainSnapshot = voiceGain
         exporting = true
         updateProgress()
         Thread {
             try {
                 val savedUri = VideoExporter.export(
-                    this@MainActivity, source, segSnapshot, textSnapshot, fileSnapshot, speedSnapshot
+                    this@MainActivity, source, segSnapshot, textSnapshot, fileSnapshot,
+                    vsSnapshot, gainSnapshot
                 )
                 runOnUiThread {
                     exporting = false
@@ -1426,8 +1378,7 @@ Character dialogue rules (မဖြစ်မနေ လိုက်နာရန�
         handler.removeCallbacks(ticker)
         stopReq = true
         ttsStop = true
-        ttsPlayer?.release()
-        try { ttsEnhancer?.release() } catch (e: Throwable) { }
+        releasePlayer()
         super.onDestroy()
     }
 
