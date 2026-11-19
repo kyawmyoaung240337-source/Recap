@@ -24,14 +24,31 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+class ScenePlan(val dur: Double, val vSpeed: Double, val aSpeed: Double)
+
+private const val MAX_AUDIO_SQUEEZE = 1.15
+private const val MAX_AUDIO_HARD = 1.4
+private const val MIN_VIDEO_SPEED = 0.75
+
+/** c = မူရင်း clip စက္ကန့်၊ t = အသံ စက္ကန့်၊ vs = video speed */
+fun planScene(c: Double, t: Double, vs: Double): ScenePlan {
+    if (t <= 0.05) return ScenePlan(c / vs, vs, 1.0)
+    val fast = c / vs
+    if (t <= fast) return ScenePlan(fast, vs, 1.0)
+    if (t <= c) return ScenePlan(t, c / t, 1.0)
+    var a = minOf(t / c, MAX_AUDIO_SQUEEZE)
+    var d = t / a
+    if (c / d < MIN_VIDEO_SPEED) {
+        d = c / MIN_VIDEO_SPEED
+        a = minOf(t / d, MAX_AUDIO_HARD)
+        d = t / a
+    }
+    return ScenePlan(d, c / d, a)
+}
+
 /** ခန်းတစ်ခုချင်း render → ပေါင်း → Movies/Recap. Background thread ကနေ ခေါ်ပါ။ */
 object VideoExporter {
-    private class Plan(val dur: Double, val vSpeed: Double, val aSpeed: Double)
     private class Cancelled : RuntimeException("Render ရပ်လိုက်ပါပြီ")
-
-    private const val MAX_AUDIO_SQUEEZE = 1.15
-    private const val MAX_AUDIO_HARD = 1.4
-    private const val MIN_VIDEO_SPEED = 0.75
 
     @Volatile private var lastStage = ""
     @Volatile private var cancelled = false
@@ -42,31 +59,6 @@ object VideoExporter {
     }
 
     private fun f3(v: Double) = String.format(Locale.US, "%.3f", v)
-
-    // Video speed ခလုတ်ရဲ့ တန်ဖိုးကို MainActivity ကနေ ဖတ် (မရရင် 1.3)
-    private fun readVideoSpeed(context: Context): Double = try {
-        val f = context.javaClass.getDeclaredField("videoSpeed")
-        f.isAccessible = true
-        f.getDouble(context).coerceIn(1.0, 2.0)
-    } catch (e: Throwable) {
-        1.3
-    }
-
-    // c = မူရင်း clip စက္ကန့်၊ t = အသံ စက္ကန့်၊ vs = video speed
-    private fun plan(c: Double, t: Double, vs: Double): Plan {
-        if (t <= 0.05) return Plan(c / vs, vs, 1.0)
-        val fast = c / vs
-        if (t <= fast) return Plan(fast, vs, 1.0)
-        if (t <= c) return Plan(t, c / t, 1.0)
-        var a = minOf(t / c, MAX_AUDIO_SQUEEZE)
-        var d = t / a
-        if (c / d < MIN_VIDEO_SPEED) {
-            d = c / MIN_VIDEO_SPEED
-            a = minOf(t / d, MAX_AUDIO_HARD)
-            d = t / a
-        }
-        return Plan(d, c / d, a)
-    }
 
     private class RenderDialog(private val act: Activity?) {
         private var dialog: AlertDialog? = null
@@ -121,7 +113,8 @@ object VideoExporter {
         segments: List<Segment>,
         translations: Array<String?>,
         ttsFiles: List<File?>,
-        ttsSpeeds: DoubleArray
+        videoSpeed: Double,
+        gain: Double
     ): Uri {
         lastStage = "စတင်နေ"
         cancelled = false
@@ -137,8 +130,7 @@ object VideoExporter {
         }
         require(segments.indices.any { voiceOf(it) != null }) { "No generated voice-over audio. Generate TTS first." }
 
-        val vs = readVideoSpeed(context)
-        val gain = RenderSettings.voiceGain.coerceIn(0.5, 6.0)
+        val vs = videoSpeed.coerceIn(1.0, 2.0)
         val total = segments.size
         val ui = RenderDialog(context as? Activity)
 
@@ -178,7 +170,7 @@ object VideoExporter {
                 if (c <= 0.05) continue
                 val voice = voiceOf(i)
                 val t = if (voice != null) durationOf(voice) / 1000.0 else 0.0
-                val p = plan(c, t, vs)
+                val p = planScene(c, t, vs)
 
                 stage("ခန်း ${i + 1}/$total render")
                 ui.update(scenes.size, total, "ခန်း ${i + 1} render နေပါတယ်...")
@@ -199,10 +191,9 @@ object VideoExporter {
                 } else {
                     args.addAll(listOf("-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono"))
                 }
-                // အသံ: speed ညှိ → volume မြှင့် → peak မကျော်အောင် limiter → ခန်းအရှည်အထိ တိတ်ဆိတ်ဖြည့်
+                val boost = if (gain > 1.001) ",volume=${f3(gain)},alimiter=limit=0.97" else ""
                 val af = if (voice != null)
-                    "atempo=${f3(p.aSpeed)},volume=${f3(gain)},alimiter=limit=0.95:level=0," +
-                        "aformat=sample_rates=48000:channel_layouts=mono,apad=whole_dur=${f3(p.dur)}"
+                    "atempo=${f3(p.aSpeed)},aformat=sample_rates=48000:channel_layouts=mono$boost,apad=whole_dur=${f3(p.dur)}"
                 else
                     "aformat=sample_rates=48000:channel_layouts=mono"
                 args.addAll(
@@ -337,7 +328,6 @@ object VideoExporter {
         }
     }
 
-    // ခန်းတစ်ခုအတွက် caption ဖိုင် (ခန်းစကတည်းက ခန်းအဆုံးထိ ပြ)
     private fun writeAssScene(target: File, caption: String, durSec: Double, width: Int, height: Int) {
         val fontSize = (minOf(width, height) * 0.052).toInt().coerceIn(28, 68)
         val marginV = (height * 0.045).toInt().coerceAtLeast(24)
