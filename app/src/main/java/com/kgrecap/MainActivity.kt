@@ -36,8 +36,6 @@ import android.widget.VideoView
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
-import java.net.HttpURLConnection
-import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
@@ -67,26 +65,14 @@ class MainActivity : Activity() {
     private var voiceIdx = 0
     private var customVoice = ""
 
-    private val langs = listOf(
-        "zh" to "Chinese", "en" to "English", "th" to "Thai",
-        "my" to "Myanmar", "auto" to "Auto"
-    )
-    private val models = listOf(
-        Triple("base", "ggml-base-q5_1.bin", "57MB"),
-        Triple("small", "ggml-small-q5_1.bin", "181MB")
-    )
-    private var langIdx = 0
-    private var workers = 2
-    private var modelIdx = 0
-    private var toEnglish = false
+    private val gainOpts = doubleArrayOf(1.0, 1.5, 2.0, 3.0, 4.0)
+    private var voiceGain = 2.0
 
     private lateinit var list: ListView
     private lateinit var video: VideoView
     private lateinit var adapter: ArrayAdapter<String>
-    private lateinit var btnLang: Button
-    private lateinit var btnWorkers: Button
-    private lateinit var btnModel: Button
-    private lateinit var btnOut: Button
+    private lateinit var btnKey: Button
+    private lateinit var btnGain: Button
     private lateinit var btnRun: Button
     private lateinit var btnCopy: Button
     private lateinit var btnPaste: Button
@@ -120,13 +106,13 @@ class MainActivity : Activity() {
     @Volatile private var loadId = 0
     @Volatile private var running = false
     @Volatile private var stopReq = false
-    private var downloading = false
     private val handler = Handler(Looper.getMainLooper())
 
     @Volatile private var ttsRunning = false
     @Volatile private var ttsStop = false
     private var sampling = false
     private var ttsPlayer: MediaPlayer? = null
+    private var ttsEnhancer: android.media.audiofx.LoudnessEnhancer? = null
     private var sourceVideoUri: Uri? = null
     @Volatile private var exporting = false
 
@@ -194,44 +180,22 @@ class MainActivity : Activity() {
                 Gravity.CENTER
             )
         )
+        val dpi = resources.displayMetrics.density
+        btnKey = Button(this)
+        btnKey.text = "🔑"
+        btnKey.textSize = 16f
+        btnKey.setPadding(0, 0, 0, 0)
+        btnKey.setOnClickListener { showKeyDialog() }
+        val keyLp = FrameLayout.LayoutParams((44 * dpi).toInt(), (44 * dpi).toInt(), Gravity.TOP or Gravity.END)
+        keyLp.setMargins(0, (8 * dpi).toInt(), (8 * dpi).toInt(), 0)
+        box.addView(btnKey, keyLp)
         root.addView(box, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, videoH))
 
         val btnPick = button("Video ရွေးပါ") { pickVideo() }
 
         // ----- စာထုတ် panel -----
-        btnLang = button("") {
-            langIdx = (langIdx + 1) % langs.size
-            updateButtons()
-        }
-        btnWorkers = button("") {
-            if (!running) {
-                workers = workers % 3 + 1
-                updateButtons()
-            }
-        }
-        btnModel = button("") {
-            if (!running && !downloading) {
-                modelIdx = (modelIdx + 1) % models.size
-                updateButtons()
-            }
-        }
-        btnOut = button("") {
-            if (!running) {
-                toEnglish = !toEnglish
-                if (texts.any { it != null }) {
-                    clearTexts()
-                    Toast.makeText(
-                        this, "Output ပြောင်းလို့ စာတွေ ရှင်းပြီး၊ Transcribe ပြန်လုပ်ပါ",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-                updateButtons()
-            }
-        }
         btnRun = button("") { onRun() }
         panel0 = vbox()
-        panel0.addView(row(btnLang, btnWorkers, btnModel))
-        panel0.addView(row(btnOut))
         panel0.addView(btnRun)
 
         // ----- ဘာသာပြန် panel -----
@@ -252,10 +216,12 @@ class MainActivity : Activity() {
         btnVoiceId = button("Voice ID ထည့်") { askCustomVoice() }
         btnPause = button("") { cyclePause() }
         btnSample = button("▶ နမူနာ") { playSample() }
+        btnGain = button("") { cycleGain() }
         panel2 = vbox()
         panel2.addView(row(btnVoice, btnVoiceId))
         panel2.addView(row(btnPause, btnSample))
         panel2.addView(speedRow())
+        panel2.addView(row(btnGain))
         panel2.addView(btnTts)
         panel2.addView(btnExport)
 
@@ -290,6 +256,7 @@ class MainActivity : Activity() {
         }
         root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
+        RenderSettings.voiceGain = voiceGain
         setContentView(root)
         updateButtons()
         applyPanels()
@@ -390,6 +357,84 @@ class MainActivity : Activity() {
         btnVoice.text = "Voice: " +
             (if (voiceIdx < EdgeTts.presets.size) EdgeTts.presets[voiceIdx].label else "Custom")
         btnPause.text = "နားချိန်: " + pauseNames[pauseIdx]
+        btnGain.text = "Voice volume: ${Math.round(voiceGain * 100)}%"
+    }
+
+    // အသံ volume (render + နားထောင်ကြည့်တာ) — TTS ပြန်ထုတ်စရာ မလို
+    private fun cycleGain() {
+        val i = gainOpts.indexOfFirst { Math.abs(it - voiceGain) < 0.001 }
+        voiceGain = gainOpts[(i + 1) % gainOpts.size]
+        RenderSettings.voiceGain = voiceGain
+        updateVoiceButtons()
+        Toast.makeText(this, "Volume ${Math.round(voiceGain * 100)}% — ▶ နမူနာနဲ့ နားထောင်ကြည့်ပါ", Toast.LENGTH_SHORT).show()
+    }
+
+    // ---------------- API key ----------------
+
+    private fun updateKeyButton() {
+        if (!::btnKey.isInitialized) return
+        val ok = KeyStore.get(this, KeyStore.DEEPGRAM).isNotBlank()
+        val bg = android.graphics.drawable.GradientDrawable()
+        bg.shape = android.graphics.drawable.GradientDrawable.OVAL
+        bg.setColor(Color.parseColor(if (ok) "#CC2E7D32" else "#CCC62828"))
+        btnKey.background = bg
+    }
+
+    private fun showKeyDialog() {
+        val dp = resources.displayMetrics.density
+        val saved = KeyStore.get(this, KeyStore.DEEPGRAM)
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding((20 * dp).toInt(), (12 * dp).toInt(), (20 * dp).toInt(), 0)
+        val label = TextView(this)
+        label.text = "Deepgram API key (စာထုတ်ဖို့)"
+        val input = EditText(this)
+        input.setSingleLine(true)
+        input.hint = if (saved.isNotEmpty()) "လက်ရှိ: " + KeyStore.mask(saved) else "Key ကို ဒီမှာ paste လုပ်ပါ"
+        val status = TextView(this)
+        status.textSize = 13f
+        status.setPadding(0, (8 * dp).toInt(), 0, 0)
+        status.text = if (saved.isNotEmpty()) "✓ Key သိမ်းထားပြီး" else "Key မထည့်ရသေးပါ"
+        box.addView(label)
+        box.addView(input)
+        box.addView(status)
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("🔑 API Keys")
+            .setView(box)
+            .setPositiveButton("Save", null)
+            .setNeutralButton("ဖျက်မယ်") { _, _ ->
+                KeyStore.set(this@MainActivity, KeyStore.DEEPGRAM, "")
+                updateKeyButton()
+                updateProgress()
+            }
+            .setNegativeButton("Close", null)
+            .create()
+        dlg.show()
+        val save = dlg.getButton(AlertDialog.BUTTON_POSITIVE)
+        save.setOnClickListener {
+            val key = input.text.toString().trim()
+            if (key.isEmpty()) {
+                status.text = "Key ရိုက်ထည့်ပါ"
+                return@setOnClickListener
+            }
+            save.isEnabled = false
+            status.text = "Key ကို စစ်နေပါတယ်..."
+            Thread {
+                val r = Deepgram.validate(key)
+                runOnUiThread {
+                    save.isEnabled = true
+                    if (r.ok) {
+                        KeyStore.set(this@MainActivity, KeyStore.DEEPGRAM, key)
+                        updateKeyButton()
+                        updateProgress()
+                        Toast.makeText(this@MainActivity, "✓ Key အလုပ်လုပ်ပါတယ်၊ သိမ်းပြီးပါပြီ", Toast.LENGTH_LONG).show()
+                        dlg.dismiss()
+                    } else {
+                        status.text = "✗ " + r.message + "\n(Key ကို မသိမ်းပါ)"
+                    }
+                }
+            }.start()
+        }
     }
 
     // အသံ setting ပြောင်းရင် ထုတ်ပြီးသား အသံတွေ ပျက်ပြီ
@@ -417,12 +462,9 @@ class MainActivity : Activity() {
     private fun nTts() = ttsMs.count { it > 0L }
 
     private fun updateButtons() {
-        btnLang.text = "Lang: ${langs[langIdx].second}"
-        btnWorkers.text = "Workers: $workers"
-        btnModel.text = "Model: ${models[modelIdx].first}"
-        btnOut.text = if (toEnglish) "Output: English" else "Output: Original"
         updateSpeedButtons()
         updateVoiceButtons()
+        updateKeyButton()
         updateProgress()
     }
 
@@ -448,19 +490,16 @@ class MainActivity : Activity() {
         btnExport.isEnabled = !exporting
     }
 
-    private fun modelFile() = File(filesDir, models[modelIdx].second)
-
     private fun updateRunButton() {
         val n = texts.size
         val d = nDone()
         btnRun.text = when {
-            downloading -> "Downloading..."
             analyzing -> "အသံစစ်နေပါတယ်..."
             running && stopReq -> "ရပ်နေပါတယ်... $d/$n"
             running -> "စာထုတ်နေ $d/$n (ကျန် ${n - d}) • ရပ်မယ်"
-            !modelFile().exists() -> "Model download (${models[modelIdx].third})"
             n == 0 -> "Transcribe (Video ရွေးပါ)"
-            d == 0 -> "Transcribe စတင်မယ်"
+            KeyStore.get(this, KeyStore.DEEPGRAM).isBlank() -> "🔑 Deepgram key အရင်ထည့်ပါ"
+            d == 0 -> "Transcribe စတင်မယ် (Deepgram)"
             d < n -> "ဆက်လုပ်မယ် $d/$n (ကျန် ${n - d})"
             else -> "စာထုတ်ပြီး $d/$n ✓"
         }
@@ -484,71 +523,16 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------------- Whisper ----------------
+    // ---------------- Deepgram (စာထုတ်) ----------------
 
     private fun onRun() {
-        if (downloading || analyzing) return
+        if (analyzing) return
         if (running) {
             stopReq = true
             updateRunButton()
             return
         }
-        if (!modelFile().exists()) {
-            downloadModel()
-            return
-        }
         startTranscribe()
-    }
-
-    private fun downloadModel() {
-        downloading = true
-        updateRunButton()
-        val name = models[modelIdx].second
-        val target = modelFile()
-        Thread {
-            var err: String? = null
-            try {
-                val url = URL("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$name")
-                val c = url.openConnection() as HttpURLConnection
-                c.connectTimeout = 15000
-                c.readTimeout = 30000
-                c.instanceFollowRedirects = true
-                c.connect()
-                if (c.responseCode != 200) throw RuntimeException("HTTP ${c.responseCode}")
-                val total = c.contentLengthLong
-                val part = File(filesDir, "$name.part")
-                c.inputStream.use { ins ->
-                    FileOutputStream(part).use { os ->
-                        val buf = ByteArray(65536)
-                        var done = 0L
-                        var last = 0L
-                        while (true) {
-                            val n = ins.read(buf)
-                            if (n < 0) break
-                            os.write(buf, 0, n)
-                            done += n
-                            val now = System.currentTimeMillis()
-                            if (now - last > 500) {
-                                last = now
-                                val pct = if (total > 0) " ${done * 100 / total}%" else ""
-                                val mb = done / 1_000_000
-                                runOnUiThread { btnRun.text = "Downloading...$pct (${mb}MB)" }
-                            }
-                        }
-                    }
-                }
-                if (!part.renameTo(target)) throw RuntimeException("rename failed")
-            } catch (e: Exception) {
-                err = e.message ?: e.toString()
-            }
-            runOnUiThread {
-                downloading = false
-                updateRunButton()
-                if (err != null) {
-                    Toast.makeText(this@MainActivity, "Download error: $err", Toast.LENGTH_LONG).show()
-                }
-            }
-        }.start()
     }
 
     private fun startTranscribe() {
@@ -557,56 +541,56 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Video ရွေးပြီး အသံစစ်တာ ပြီးမှ လုပ်ပါ", Toast.LENGTH_SHORT).show()
             return
         }
+        val key = KeyStore.get(this, KeyStore.DEEPGRAM)
+        if (key.isBlank()) {
+            Toast.makeText(this, "🔑 Deepgram key အရင်ထည့်ပါ", Toast.LENGTH_SHORT).show()
+            showKeyDialog()
+            return
+        }
         running = true
         stopReq = false
         updateRunButton()
         val id = loadId
         val segs = segments
         val tx = texts
-        val lang = langs[langIdx].first
-        val translate = toEnglish
-        val nWorkers = workers
-        val threads = maxOf(1, minOf(4, Runtime.getRuntime().availableProcessors() / nWorkers))
-        val modelPath = modelFile().absolutePath
         val next = AtomicInteger(0)
         val finished = AtomicInteger(0)
+        val errRef = AtomicReference<String?>(null)
+        val authFail = java.util.concurrent.atomic.AtomicBoolean(false)
+        val nThreads = 3
 
-        for (k in 0 until nWorkers) {
+        for (k in 0 until nThreads) {
             Thread {
-                var ptr = 0L
-                try {
-                    ptr = WhisperBridge.nativeInit(modelPath)
-                    if (ptr == 0L) {
+                while (!stopReq && id == loadId && errRef.get() == null) {
+                    val i = next.getAndIncrement()
+                    if (i >= segs.size) break
+                    if (tx[i] != null) continue
+                    try {
+                        val raw = readPcmBytes(pcm, segs[i])
+                        val text = if (raw.size < 3200) ""
+                        else Deepgram.transcribe(key, Deepgram.wavOf(raw)).trim()
                         runOnUiThread {
-                            Toast.makeText(this@MainActivity, "Model load မရပါ", Toast.LENGTH_LONG).show()
-                        }
-                    } else {
-                        while (!stopReq && id == loadId) {
-                            val i = next.getAndIncrement()
-                            if (i >= segs.size) break
-                            if (tx[i] != null) continue
-                            val audio = readPcm(pcm, segs[i])
-                            val text = if (audio.size < 1600) ""
-                            else WhisperBridge.nativeTranscribe(ptr, audio, lang, threads, translate).trim()
-                            runOnUiThread {
-                                if (id == loadId) {
-                                    tx[i] = text
-                                    refreshLabel(i)
-                                }
+                            if (id == loadId) {
+                                tx[i] = text
+                                refreshLabel(i)
                             }
                         }
+                    } catch (e: Deepgram.ApiError) {
+                        if (e.code == 401 || e.code == 403) authFail.set(true)
+                        errRef.compareAndSet(null, e.message ?: "Deepgram error")
+                    } catch (e: Exception) {
+                        errRef.compareAndSet(null, e.message ?: e.toString())
                     }
-                } catch (e: Throwable) {
+                }
+                if (finished.incrementAndGet() == nThreads) {
                     runOnUiThread {
-                        Toast.makeText(this@MainActivity, "Error: ${e.message}", Toast.LENGTH_LONG).show()
-                    }
-                } finally {
-                    if (ptr != 0L) WhisperBridge.nativeFree(ptr)
-                    if (finished.incrementAndGet() == nWorkers) {
-                        runOnUiThread {
-                            running = false
-                            stopReq = false
-                            updateRunButton()
+                        running = false
+                        stopReq = false
+                        updateRunButton()
+                        val e = errRef.get()
+                        if (e != null) {
+                            Toast.makeText(this@MainActivity, e, Toast.LENGTH_LONG).show()
+                            if (authFail.get()) showKeyDialog()
                         }
                     }
                 }
@@ -614,20 +598,17 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun readPcm(f: File, s: Segment): FloatArray {
+    private fun readPcmBytes(f: File, s: Segment): ByteArray {
         RandomAccessFile(f, "r").use { raf ->
             val total = raf.length() / 2
             val a = minOf(total, s.startMs * 16)
             val b = minOf(total, s.endMs * 16)
             val n = (b - a).toInt()
-            if (n <= 0) return FloatArray(0)
+            if (n <= 0) return ByteArray(0)
             val bytes = ByteArray(n * 2)
             raf.seek(a * 2)
             raf.readFully(bytes)
-            val sb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
-            val out = FloatArray(n)
-            for (i in 0 until n) out[i] = sb.get(i) / 32768f
-            return out
+            return bytes
         }
     }
 
@@ -701,12 +682,8 @@ class MainActivity : Activity() {
     // ---------------- Copy / Paste ----------------
 
     private fun buildPrompt(): String {
-        val src = if (toEnglish)
-            "English (machine-translated from a drama, so it may contain mistakes)"
-        else
-            "the original spoken language (speech recognition output, so it may contain mistakes)"
         return """[INSTRUCTION FOR AI TRANSLATOR]
-Translate each numbered dialogue part below from $src into natural spoken Myanmar (မြန်မာ).
+Translate each numbered dialogue part below from the original spoken language (speech recognition output, so it may contain mistakes) into natural spoken Myanmar (မြန်မာ).
 These lines come from a drama scene. Write them as natural character dialogue, not as a narrator. Use the neighbouring parts to work out the real meaning when the text looks wrong.
 The lines will be read aloud by a text-to-speech voice-over, so timing and clean text matter.
 
@@ -728,7 +705,18 @@ Text-to-speech rules (everything you write will be spoken aloud):
 11. Plain words only. No parentheses, brackets, ellipsis (...), emoji, symbols or stage directions.
 12. Use the Myanmar punctuation marks ၊ and ။ properly. The voice-over pauses at them. Put ၊ at every natural short pause inside a sentence (about every 6 to 12 syllables) and end every sentence with ။. Never write a long run-on line without them.
 13. Do not add words such as ရှင်, ရှင့်, ခင်ဗျာ, ဗျာ, ကွယ်, နော် (gender or politeness endings). Write neutral plain spoken sentences.
-14. Do not add any word that is not part of the original meaning."""
+14. Do not add any word that is not part of the original meaning.
+
+Character dialogue rules (မဖြစ်မနေ လိုက်နာရန်):
+15. သဘာဝကျကျ စကားပြောဟန် ဖြစ်ရမည်: မှတ်တမ်းရုပ်ရှင် ဇာတ်ကြောင်းပြော (Narrator) သို့မဟုတ် အကျဉ်းချုပ်ပြောသလိုမျိုး မဟုတ်ဘဲ၊ ဇာတ်ကောင်တွေ အမှန်တကယ် ပြောဆိုနေကြသကဲ့သို့ သဘာဝကျပြီး ဒရမ်မာဆန်သော စကားပြောဟန် (Dramatic Character Dialogue) ဖြစ်ရပါမယ်။
+16. အချိတ်အဆက် မိရမည်: အပိုင်းတစ်ပိုင်းနဲ့ တစ်ပိုင်း (Turns) အကြား ခံစားချက်၊ စကားအပြန်အလှန် အချိတ်အဆက်နဲ့ စီးဆင်းမှု မပြတ်တောက်ဘဲ သဘာဝကျရပါမယ်။ ဒါပေမဲ့ အပိုင်းတစ်ခုရဲ့ စာကို နောက်အပိုင်းထဲ မရောရ။
+17. လုံးဝ ရောနှောခြင်း မပြုရ:
+   - မြန်မာစာ သက်သက်သာ ဖြစ်ရမည်: အင်္ဂလိပ်စာလုံး လုံးဝ မပါရပါ။ အင်္ဂလိပ် စကားလုံးများကို မြန်မာအသံထွက်ဖြင့် မြန်မာစာလုံးပေါင်းဖြင့်သာ ရေးသားရပါမယ်။
+   - သန့်စင်သော ဇာတ်ညွှန်း စာသား ဖြစ်ရမည် (Clean Output):
+     • Markdown ခေါင်းစဉ်များ (##)၊ စာသားအထူ (**)၊ စာသားစောင်း (*) လုံးဝ မပါရပါ။
+     • Man:၊ Woman: ကဲ့သို့သော ပြောသူအမည် တဂ်များ မပါရပါ။
+     • အမူအရာပြ ကွင်းစကွင်းပိတ်များ ((angrily) ကဲ့သို့သော စာသားများ) မပါရပါ။
+     • နှုတ်ခွန်းဆက်စကား သို့မဟုတ် အပိုစကားများ လုံးဝ မပါရပါ။"""
     }
 
     private fun copyAll() {
@@ -803,7 +791,7 @@ Text-to-speech rules (everything you write will be spoken aloud):
         box.orientation = LinearLayout.VERTICAL
         box.setPadding(40, 20, 40, 0)
         val l1 = TextView(this)
-        l1.text = "မူရင်းစာ (Whisper)"
+        l1.text = "မူရင်းစာ"
         val e1 = EditText(this)
         e1.setText(texts[i] ?: "")
         val l2 = TextView(this)
@@ -840,15 +828,30 @@ Text-to-speech rules (everything you write will be spoken aloud):
     private fun playFile(f: File, speed: Double) {
         if (!f.exists()) return
         ttsPlayer?.release()
+        try { ttsEnhancer?.release() } catch (e: Throwable) { }
+        ttsEnhancer = null
         val p = MediaPlayer()
         try {
             p.setDataSource(f.absolutePath)
             p.prepare()
-            p.setOnCompletionListener { it.release() }
+            p.setOnCompletionListener {
+                try { ttsEnhancer?.release() } catch (e: Throwable) { }
+                ttsEnhancer = null
+                it.release()
+            }
             if (speed > 1.001) {
                 try {
                     p.playbackParams = PlaybackParams().setSpeed(speed.toFloat()).setPitch(1.0f)
                 } catch (e: Exception) { }
+            }
+            // Volume ကို 100% ထက် မြှင့်ဖို့ (နားထောင်ကြည့်တာအတွက်)
+            if (voiceGain > 1.001) {
+                try {
+                    val le = android.media.audiofx.LoudnessEnhancer(p.audioSessionId)
+                    le.setTargetGain((20.0 * Math.log10(voiceGain) * 100.0).toInt())
+                    le.enabled = true
+                    ttsEnhancer = le
+                } catch (e: Throwable) { }
             }
             if (!p.isPlaying) p.start()
             ttsPlayer = p
@@ -1424,6 +1427,7 @@ Text-to-speech rules (everything you write will be spoken aloud):
         stopReq = true
         ttsStop = true
         ttsPlayer?.release()
+        try { ttsEnhancer?.release() } catch (e: Throwable) { }
         super.onDestroy()
     }
 
