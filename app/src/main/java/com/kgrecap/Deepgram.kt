@@ -1,62 +1,42 @@
 package com.kgrecap
 
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
-import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-/** Deepgram speech-to-text (nova-3, ဘာသာစကား အလိုအလျောက်သိ) */
+class DeepgramException(val code: Int, msg: String) : Exception(msg)
+
 object Deepgram {
-    class ApiError(val code: Int, msg: String) : Exception(msg)
-    class Result(val ok: Boolean, val message: String)
+    private const val BASE = "https://api.deepgram.com/v1"
 
-    private const val LISTEN =
-        "https://api.deepgram.com/v1/listen?model=nova-3&language=multi&smart_format=true&punctuate=true"
-    private const val AUTH = "https://api.deepgram.com/v1/auth/token"
-
-    private fun readAll(c: HttpURLConnection, error: Boolean): String {
-        val s = (if (error) c.errorStream else c.inputStream) ?: return ""
-        val out = ByteArrayOutputStream()
-        s.use { it.copyTo(out) }
-        return out.toString("UTF-8")
-    }
-
-    private fun explain(code: Int, body: String): String = when (code) {
-        401, 403 -> "Deepgram key မမှန်ပါ (သို့) ခွင့်ပြုချက်မရှိပါ"
-        402 -> "Deepgram credit ကုန်နေပါပြီ"
-        429 -> "Deepgram request များလွန်းနေပါတယ်၊ ခဏနေမှ ထပ်လုပ်ပါ"
-        else -> "Deepgram error $code " + body.take(200)
-    }
-
-    /** Key အလုပ်လုပ်မလုပ် စစ်: GET /v1/auth/token */
-    fun validate(key: String): Result {
+    /** null = key အလုပ်လုပ်တယ်၊ တခြားဆို error စာ */
+    fun validate(key: String): String? {
+        val k = key.trim()
+        if (k.isEmpty()) return "Key ထည့်ပါ"
+        var c: HttpURLConnection? = null
         return try {
-            val c = URL(AUTH).openConnection() as HttpURLConnection
-            try {
-                c.connectTimeout = 15000
-                c.readTimeout = 20000
-                c.setRequestProperty("Authorization", "Token $key")
-                val code = c.responseCode
-                if (code == 200) {
-                    Result(true, "OK")
-                } else {
-                    Result(false, explain(code, readAll(c, true)))
-                }
-            } finally {
-                c.disconnect()
+            c = URL("$BASE/auth/token").openConnection() as HttpURLConnection
+            c.requestMethod = "GET"
+            c.connectTimeout = 15000
+            c.readTimeout = 20000
+            c.setRequestProperty("Authorization", "Token $k")
+            val code = c.responseCode
+            when {
+                code in 200..299 -> null
+                code == 401 || code == 403 -> "Key မမှန်ပါ (HTTP $code)"
+                else -> "စစ်လို့မရပါ (HTTP $code)"
             }
-        } catch (e: IOException) {
-            Result(false, "အင်တာနက် ချိတ်မရလို့ key ကို မစစ်နိုင်ပါ")
         } catch (e: Exception) {
-            Result(false, e.message ?: e.toString())
+            "အင်တာနက် ချိတ်ဆက်မရပါ: ${e.message}"
+        } finally {
+            c?.disconnect()
         }
     }
 
-    /** 16kHz mono 16-bit PCM ကို WAV ဖိုင်ပုံစံ ပြောင်း */
-    fun wavOf(pcm: ByteArray, rate: Int = 16000): ByteArray {
+    /** 16kHz mono PCM16 (little-endian) bytes → WAV bytes */
+    fun wav(pcm: ByteArray, rate: Int = 16000): ByteArray {
         val h = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
         h.put("RIFF".toByteArray())
         h.putInt(36 + pcm.size)
@@ -71,57 +51,65 @@ object Deepgram {
         h.putShort(16)
         h.put("data".toByteArray())
         h.putInt(pcm.size)
-        val out = ByteArray(44 + pcm.size)
-        System.arraycopy(h.array(), 0, out, 0, 44)
-        System.arraycopy(pcm, 0, out, 44, pcm.size)
-        return out
+        return h.array() + pcm
     }
 
-    /** WAV တစ်ပိုင်းကို စာထုတ် (မူရင်းဘာသာစကား အတိုင်း) */
     fun transcribe(key: String, wav: ByteArray): String {
         var attempt = 0
         while (true) {
-            val c = URL(LISTEN).openConnection() as HttpURLConnection
+            attempt++
             try {
-                c.requestMethod = "POST"
-                c.doOutput = true
-                c.connectTimeout = 20000
-                c.readTimeout = 60000
-                c.setRequestProperty("Authorization", "Token $key")
-                c.setRequestProperty("Content-Type", "audio/wav")
-                c.setFixedLengthStreamingMode(wav.size)
-                c.outputStream.use { it.write(wav) }
-                val code = c.responseCode
-                if (code == 200) {
-                    return parse(readAll(c, false))
-                }
-                val body = readAll(c, true)
-                if ((code == 429 || code >= 500) && attempt < 3) {
-                    attempt++
-                    Thread.sleep(1500L * attempt)
-                    continue
-                }
-                throw ApiError(code, explain(code, body))
-            } catch (e: IOException) {
-                if (attempt < 2) {
-                    attempt++
-                    Thread.sleep(1000L * attempt)
-                    continue
-                }
-                throw Exception("အင်တာနက် ချိတ်မရပါ: " + (e.message ?: ""))
-            } finally {
-                c.disconnect()
+                return once(key, wav)
+            } catch (e: DeepgramException) {
+                val retry = e.code == 429 || e.code >= 500 || e.code == -1
+                if (!retry || attempt >= 3) throw e
+                Thread.sleep(800L * attempt)
             }
         }
     }
 
+    private fun once(key: String, wav: ByteArray): String {
+        var c: HttpURLConnection? = null
+        try {
+            val url = URL("$BASE/listen?model=nova-3&language=multi&smart_format=true&punctuate=true")
+            c = url.openConnection() as HttpURLConnection
+            c.requestMethod = "POST"
+            c.doOutput = true
+            c.connectTimeout = 15000
+            c.readTimeout = 60000
+            c.setRequestProperty("Authorization", "Token ${key.trim()}")
+            c.setRequestProperty("Content-Type", "audio/wav")
+            c.setFixedLengthStreamingMode(wav.size)
+            c.outputStream.use { it.write(wav) }
+            val code = c.responseCode
+            val stream = if (code in 200..299) c.inputStream else c.errorStream
+            val body = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            if (code !in 200..299) throw DeepgramException(code, errorText(code, body))
+            return parse(body)
+        } catch (e: DeepgramException) {
+            throw e
+        } catch (e: Exception) {
+            throw DeepgramException(-1, "အင်တာနက် ချိတ်ဆက်မရပါ: ${e.message}")
+        } finally {
+            c?.disconnect()
+        }
+    }
+
     private fun parse(body: String): String {
-        val alt = JSONObject(body)
-            .optJSONObject("results")
-            ?.optJSONArray("channels")
-            ?.optJSONObject(0)
-            ?.optJSONArray("alternatives")
-            ?.optJSONObject(0)
-        return alt?.optString("transcript", "") ?: ""
+        try {
+            val alt = JSONObject(body).getJSONObject("results")
+                .getJSONArray("channels").getJSONObject(0)
+                .getJSONArray("alternatives").getJSONObject(0)
+            return alt.optString("transcript", "").trim()
+        } catch (e: Exception) {
+            throw DeepgramException(-2, "Deepgram ပြန်စာ မှန်ကန်မှုမရှိပါ: ${body.take(120)}")
+        }
+    }
+
+    private fun errorText(code: Int, body: String): String = when (code) {
+        401, 403 -> "Key မမှန်/ခွင့်မရှိပါ (HTTP $code)"
+        402 -> "Deepgram balance/credit မလောက်ပါ (HTTP 402)"
+        429 -> "တောင်းဆိုမှု များလွန်းနေပါတယ် (HTTP 429)"
+        else -> "HTTP $code: " + body.take(200)
     }
 }
