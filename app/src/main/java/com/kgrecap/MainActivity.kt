@@ -555,7 +555,7 @@ class MainActivity : Activity() {
                 while (!stopReq && id == loadId && errRef.get() == null) {
                     val i = next.getAndIncrement()
                     if (i >= segs.size) break
-                    if (tx[i] != null) continue
+                                        if (tx[i] != null && tx[i]?.isBlank() == false) continue
                     try {
                         val bytes = readPcmBytes(pcm, segs[i])
                         var text = ""
