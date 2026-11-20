@@ -46,14 +46,14 @@ class MainActivity : Activity() {
     private val videoHeightRatio = 0.36
     private val transcribeWorkers = 3
 
-    private val videoOpts = doubleArrayOf(1.1, 1.3, 1.5)
+    private val videoOpts = doubleArrayOf(1.0, 1.1, 1.3, 1.5)
     private val voiceOpts = doubleArrayOf(1.0, 1.1, 1.2, 1.3)
     private val gainOpts = doubleArrayOf(1.0, 1.5, 2.0, 3.0, 4.0)
     private val silentOpts = doubleArrayOf(1.5, 2.0, 3.0, 4.0)
     private val pauseOpts = doubleArrayOf(0.6, 1.0, 1.5)
     private val pauseNames = arrayOf("နည်း", "ပုံမှန်", "များ")
     private val sylPerSec = 4.5
-    private var videoSpeed = 1.3
+    private var videoSpeed = 1.0
     private var silentSpeed = 2.0
     private var voiceSpeed = 1.2
     private var voiceGain = 2.0
@@ -170,6 +170,7 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences("kgrecap", MODE_PRIVATE)
         voiceGain = prefs.getFloat("gain", 2.0f).toDouble()
         silentSpeed = prefs.getFloat("silent", 2.0f).toDouble()
+        videoSpeed = prefs.getFloat("vspeed", 1.0f).toDouble()
 
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
@@ -313,6 +314,7 @@ class MainActivity : Activity() {
     private fun cycleVideoSpeed() {
         val i = videoOpts.indexOfFirst { Math.abs(it - videoSpeed) < 0.001 }
         videoSpeed = videoOpts[(i + 1) % videoOpts.size]
+        getSharedPreferences("kgrecap", MODE_PRIVATE).edit().putFloat("vspeed", videoSpeed.toFloat()).apply()
         updateSpeedButtons()
         refreshAll()
     }
@@ -647,10 +649,10 @@ class MainActivity : Activity() {
         val s = segments[i]
         val t = texts[i]
         val tr = trans[i]
-        val gm = if (t.isNullOrBlank()) "" else when (gender[i]) {
+        val gm = if (t != null && t.isBlank()) "" else when (gender[i]) {
             1 -> " ♂"
             2 -> " ♀"
-            else -> " ?"
+            else -> if (!t.isNullOrBlank()) " ?" else ""
         }
         var r = "[%03d]%s  %s - %s  (%.1fs)".format(
             s.index, gm, fmt(s.startMs), fmt(s.endMs), clipSec(i)
@@ -981,7 +983,6 @@ Speaker rules (very important):
             ).show()
             return
         }
-        // အပိုင်းတစ်ခုချင်းရဲ့ gender အရ အသံ
         val vIds = Array(segments.size) { i -> voiceOfPart(i).id }
         val vPitch = IntArray(segments.size) { i -> voiceOfPart(i).pitchHz }
         if (todo.any { vIds[it].isBlank() }) {
@@ -1255,15 +1256,36 @@ Speaker rules (very important):
             try {
                 db = AudioAnalyzer.decode(this, uri, pcm)
             } catch (e: Exception) { }
-            val smart = AudioAnalyzer.buildSegments(db, totalMs)
-            val usedSmart = smart.isNotEmpty()
-            val result = if (usedSmart) smart else AudioAnalyzer.fixedSegments(totalMs)
-            val mode = if (usedSmart) "pause အလိုက်" else "၁၃ စက္ကန့်စီ"
+
+            var result: List<Segment> = emptyList()
+            var mode = ""
+            if (db.isNotEmpty()) {
+                try {
+                    val f0 = Pitch.frameF0(pcm, db, AudioAnalyzer.threshold(db))
+                    val byGender = AudioAnalyzer.buildByGender(db, f0, totalMs)
+                    if (byGender.isNotEmpty()) {
+                        result = byGender
+                        mode = "ယောက်ျား/မိန်းမ အလိုက်"
+                    }
+                } catch (e: Throwable) { }
+            }
+            if (result.isEmpty()) {
+                val smart = AudioAnalyzer.buildSegments(db, totalMs)
+                if (smart.isNotEmpty()) {
+                    result = smart
+                    mode = "pause အလိုက်"
+                } else {
+                    result = AudioAnalyzer.fixedSegments(totalMs)
+                    mode = "၁၃ စက္ကန့်စီ"
+                }
+            }
             val hasPcm = db.isNotEmpty()
+            val finalResult = result
+            val finalMode = mode
             runOnUiThread {
                 if (id == loadId) {
                     pcmFile = if (hasPcm) pcm else null
-                    showSegments(result, head, mode)
+                    showSegments(finalResult, head, finalMode)
                 }
             }
         }.start()
@@ -1277,7 +1299,7 @@ Speaker rules (very important):
         ttsMs = LongArray(segs.size)
         spStart = DoubleArray(segs.size) { -1.0 }
         spEnd = DoubleArray(segs.size) { -1.0 }
-        gender = IntArray(segs.size)
+        gender = IntArray(segs.size) { segs[it].gender }
         labels.clear()
         for (i in segs.indices) labels.add(label(i))
         adapter.notifyDataSetChanged()
