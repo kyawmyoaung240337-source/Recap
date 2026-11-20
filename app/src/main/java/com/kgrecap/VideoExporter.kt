@@ -30,7 +30,7 @@ private const val MAX_AUDIO_SQUEEZE = 1.15
 private const val MAX_AUDIO_HARD = 1.4
 private const val MIN_VIDEO_SPEED = 0.75
 
-/** c = မူရင်း clip စက္ကန့်၊ t = အသံ စက္ကန့်၊ vs = video speed */
+/** c = စကားပြောပိုင်း မူရင်းစက္ကန့်၊ t = အသံ စက္ကန့်၊ vs = video speed */
 fun planScene(c: Double, t: Double, vs: Double): ScenePlan {
     if (t <= 0.05) return ScenePlan(c / vs, vs, 1.0)
     val fast = c / vs
@@ -44,6 +44,14 @@ fun planScene(c: Double, t: Double, vs: Double): ScenePlan {
         d = t / a
     }
     return ScenePlan(d, c / d, a)
+}
+
+/** ခန်းစကနေ စကားမစသေးတဲ့ အပိုင်း (စက္ကန့်)။ 0.3 စက္ကန့်အောက်ဆို မခွဲဘူး */
+fun preRollSec(c: Double, speechStartSec: Double): Double {
+    if (speechStartSec < 0.0) return 0.0
+    val pre = speechStartSec - 0.1
+    if (pre < 0.3) return 0.0
+    return minOf(pre, c - 0.5).coerceAtLeast(0.0)
 }
 
 /** ခန်းတစ်ခုချင်း render → ပေါင်း → Movies/Recap. Background thread ကနေ ခေါ်ပါ။ */
@@ -114,6 +122,7 @@ object VideoExporter {
         translations: Array<String?>,
         ttsFiles: List<File?>,
         videoSpeed: Double,
+        silentSpeed: Double,
         gain: Double
     ): Uri {
         lastStage = "စတင်နေ"
@@ -131,6 +140,7 @@ object VideoExporter {
         require(segments.indices.any { voiceOf(it) != null }) { "No generated voice-over audio. Generate TTS first." }
 
         val vs = videoSpeed.coerceIn(1.0, 2.0)
+        val ss = silentSpeed.coerceIn(1.0, 6.0)
         val total = segments.size
         val ui = RenderDialog(context as? Activity)
 
@@ -170,7 +180,13 @@ object VideoExporter {
                 if (c <= 0.05) continue
                 val voice = voiceOf(i)
                 val t = if (voice != null) durationOf(voice) / 1000.0 else 0.0
-                val p = planScene(c, t, vs)
+
+                // စကားမစခင်ပိုင်း (pre) ကို အမြန်ပြ၊ အသံက စကားစမှ စ
+                val pre = if (voice != null) preRollSec(c, (seg.speechStartMs - seg.startMs) / 1000.0) else 0.0
+                val body = c - pre
+                val p = if (voice == null) ScenePlan(c / ss, ss, 1.0) else planScene(body, t, vs)
+                val preDur = pre / ss
+                val dur = preDur + p.dur
 
                 stage("ခန်း ${i + 1}/$total render")
                 ui.update(scenes.size, total, "ခန်း ${i + 1} render နေပါတယ်...")
@@ -179,7 +195,24 @@ object VideoExporter {
                 val scene = File(cache, "scene_${i}.mp4")
                 temps.add(ass)
                 temps.add(scene)
-                writeAssScene(ass, translations[i]?.trim().orEmpty(), p.dur, width, height)
+                writeAssScene(ass, translations[i]?.trim().orEmpty(), dur, width, height)
+
+                val sub = subtitleFilter(ass, fontDir, minDim)
+                val vgraph = if (pre > 0.0) {
+                    "[0:v]split=2[va][vb];" +
+                        "[va]trim=start=0:end=${f3(pre)},setpts=(PTS-STARTPTS)/${f3(ss)}[p0];" +
+                        "[vb]trim=start=${f3(pre)},setpts=(PTS-STARTPTS)/${f3(p.vSpeed)}[p1];" +
+                        "[p0][p1]concat=n=2:v=1:a=0,fps=30,$sub[v]"
+                } else {
+                    "[0:v]setpts=(PTS-STARTPTS)/${f3(p.vSpeed)},fps=30,$sub[v]"
+                }
+                val boost = if (gain > 1.001) ",volume=${f3(gain)},alimiter=limit=0.97" else ""
+                val delayMs = (preDur * 1000.0).toInt()
+                val delay = if (delayMs > 0) ",adelay=delays=$delayMs:all=1" else ""
+                val agraph = if (voice != null)
+                    "[1:a]atempo=${f3(p.aSpeed)},aformat=sample_rates=48000:channel_layouts=mono$boost$delay,apad=whole_dur=${f3(dur)}[a]"
+                else
+                    "[1:a]aformat=sample_rates=48000:channel_layouts=mono[a]"
 
                 val args = mutableListOf(
                     "-hide_banner", "-loglevel", "error", "-y",
@@ -191,17 +224,11 @@ object VideoExporter {
                 } else {
                     args.addAll(listOf("-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono"))
                 }
-                val boost = if (gain > 1.001) ",volume=${f3(gain)},alimiter=limit=0.97" else ""
-                val af = if (voice != null)
-                    "atempo=${f3(p.aSpeed)},aformat=sample_rates=48000:channel_layouts=mono$boost,apad=whole_dur=${f3(p.dur)}"
-                else
-                    "aformat=sample_rates=48000:channel_layouts=mono"
                 args.addAll(
                     listOf(
-                        "-map", "0:v:0", "-map", "1:a:0",
-                        "-vf", "setpts=(PTS-STARTPTS)/${f3(p.vSpeed)},fps=30," + subtitleFilter(ass, fontDir, minDim),
-                        "-af", af,
-                        "-t", f3(p.dur),
+                        "-filter_complex", "$vgraph;$agraph",
+                        "-map", "[v]", "-map", "[a]",
+                        "-t", f3(dur),
                         "-c:v", "mpeg4", "-q:v", "4", "-pix_fmt", "yuv420p", "-threads", "2",
                         "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "1",
                         scene.absolutePath
