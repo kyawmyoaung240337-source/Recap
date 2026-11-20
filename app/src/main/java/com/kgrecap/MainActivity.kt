@@ -8,9 +8,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.media.MediaCodec
-import android.media.MediaExtractor
-import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.media.PlaybackParams
@@ -30,25 +27,20 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import android.widget.VideoView
 import java.io.File
-import java.io.FileOutputStream
 import java.io.RandomAccessFile
-import java.nio.ByteOrder
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.log10
 
-data class Segment(val index: Int, val startMs: Long, val endMs: Long)
-
 class MainActivity : Activity() {
-    private val frameMs = 50
-    private val maxMs = 15_000
-    private val skipGapMs = 3_000
     private val pickCode = 1
     private val exportPermissionCode = 4
     private val videoHeightRatio = 0.36
@@ -57,14 +49,17 @@ class MainActivity : Activity() {
     private val videoOpts = doubleArrayOf(1.1, 1.3, 1.5)
     private val voiceOpts = doubleArrayOf(1.0, 1.1, 1.2, 1.3)
     private val gainOpts = doubleArrayOf(1.0, 1.5, 2.0, 3.0, 4.0)
+    private val silentOpts = doubleArrayOf(1.5, 2.0, 3.0, 4.0)
     private val pauseOpts = doubleArrayOf(0.6, 1.0, 1.5)
     private val pauseNames = arrayOf("နည်း", "ပုံမှန်", "များ")
     private val sylPerSec = 4.5
     private var videoSpeed = 1.3
+    private var silentSpeed = 2.0
     private var voiceSpeed = 1.2
     private var voiceGain = 2.0
     private var pauseIdx = 1
-    private var voiceIdx = 0
+    private var maleIdx = 1
+    private var femaleIdx = 0
     private var customVoice = ""
 
     private lateinit var list: ListView
@@ -76,11 +71,14 @@ class MainActivity : Activity() {
     private lateinit var btnCopy: Button
     private lateinit var btnPaste: Button
     private lateinit var btnTts: Button
-    private lateinit var btnVoice: Button
+    private lateinit var btnVoiceM: Button
+    private lateinit var btnVoiceF: Button
+    private lateinit var btnSampleM: Button
+    private lateinit var btnSampleF: Button
     private lateinit var btnVoiceId: Button
     private lateinit var btnPause: Button
-    private lateinit var btnSample: Button
     private lateinit var btnGain: Button
+    private lateinit var btnSilent: Button
     private lateinit var btnExport: Button
     private lateinit var sec0: Button
     private lateinit var sec1: Button
@@ -98,6 +96,10 @@ class MainActivity : Activity() {
     private var texts: Array<String?> = arrayOfNulls<String>(0)
     private var trans: Array<String?> = arrayOfNulls<String>(0)
     private var ttsMs: LongArray = LongArray(0)
+    // clip ထဲက စကားစ/စကားဆုံး စက္ကန့် (-1 = မသိ)၊ gender: 0=? 1=ယောက်ျား 2=မိန်းမ
+    private var spStart: DoubleArray = DoubleArray(0)
+    private var spEnd: DoubleArray = DoubleArray(0)
+    private var gender: IntArray = IntArray(0)
     private var pcmFile: File? = null
     private var prepared = false
     private var analyzing = false
@@ -165,7 +167,9 @@ class MainActivity : Activity() {
         actionBar?.hide()
         val dm = resources.displayMetrics
         val videoH = (dm.heightPixels * videoHeightRatio).toInt()
-        voiceGain = getSharedPreferences("kgrecap", MODE_PRIVATE).getFloat("gain", 2.0f).toDouble()
+        val prefs = getSharedPreferences("kgrecap", MODE_PRIVATE)
+        voiceGain = prefs.getFloat("gain", 2.0f).toDouble()
+        silentSpeed = prefs.getFloat("silent", 2.0f).toDouble()
 
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
@@ -181,7 +185,6 @@ class MainActivity : Activity() {
                 Gravity.CENTER
             )
         )
-        // 🔑 ခလုတ်: ဗီဒီယိုရဲ့ ညာအပေါ်ထောင့်
         btnKey = Button(this)
         btnKey.text = "🔑"
         btnKey.textSize = 16f
@@ -220,7 +223,7 @@ class MainActivity : Activity() {
         btnPaste = button("") { pasteAll() }
         val hint = TextView(this)
         hint.textSize = 11f
-        hint.text = "Speed ကို Copy All မလုပ်ခင် ရွေးပါ။ ပြောင်းရင် Copy All ပြန်လုပ်ပါ။"
+        hint.text = "Speed/ယောက်ျား-မိန်းမ ကို Copy All မလုပ်ခင် သတ်မှတ်ပါ။ ပြောင်းရင် Copy All ပြန်လုပ်ပါ။"
         panel1 = vbox()
         panel1.addView(speedRow())
         panel1.addView(hint)
@@ -229,16 +232,20 @@ class MainActivity : Activity() {
         // ----- အသံ panel -----
         btnTts = button("") { onTts() }
         btnExport = button("Render / Save MP4") { onExport() }
-        btnVoice = button("") { cycleVoice() }
+        btnVoiceM = button("") { cycleVoice(true) }
+        btnVoiceF = button("") { cycleVoice(false) }
+        btnSampleM = button("▶ ♂ နမူနာ") { playSample(true) }
+        btnSampleF = button("▶ ♀ နမူနာ") { playSample(false) }
         btnVoiceId = button("Voice ID ထည့်") { askCustomVoice() }
         btnPause = button("") { cyclePause() }
-        btnSample = button("▶ နမူနာ") { playSample() }
         btnGain = button("") { cycleGain() }
+        btnSilent = button("") { cycleSilent() }
         panel2 = vbox()
-        panel2.addView(row(btnVoice, btnVoiceId))
-        panel2.addView(row(btnPause, btnSample))
+        panel2.addView(row(btnVoiceM, btnSampleM))
+        panel2.addView(row(btnVoiceF, btnSampleF))
+        panel2.addView(row(btnPause, btnVoiceId))
         panel2.addView(speedRow())
-        panel2.addView(row(btnGain))
+        panel2.addView(row(btnGain, btnSilent))
         panel2.addView(btnTts)
         panel2.addView(btnExport)
 
@@ -329,6 +336,14 @@ class MainActivity : Activity() {
         Toast.makeText(this, "Volume ပြောင်းရင် TTS ပြန်ထုတ်စရာ မလိုပါ။ ▶ နမူနာနဲ့ Render မှာ ကျပါမယ်", Toast.LENGTH_SHORT).show()
     }
 
+    private fun cycleSilent() {
+        val i = silentOpts.indexOfFirst { Math.abs(it - silentSpeed) < 0.001 }
+        silentSpeed = silentOpts[(i + 1) % silentOpts.size]
+        getSharedPreferences("kgrecap", MODE_PRIVATE).edit().putFloat("silent", silentSpeed.toFloat()).apply()
+        updateVoiceButtons()
+        refreshAll()
+    }
+
     private fun cyclePause() {
         if (ttsRunning) {
             Toast.makeText(this, "TTS ရပ်ပြီးမှ ပြောင်းပါ", Toast.LENGTH_SHORT).show()
@@ -339,13 +354,26 @@ class MainActivity : Activity() {
         invalidateTts()
     }
 
-    private fun cycleVoice() {
+    private fun choices(): List<VoicePreset> =
+        if (customVoice.isNotBlank()) EdgeTts.presets + VoicePreset("Custom: $customVoice", customVoice, 0)
+        else EdgeTts.presets
+
+    private fun choiceFor(male: Boolean): VoicePreset {
+        val c = choices()
+        val idx = (if (male) maleIdx else femaleIdx).coerceIn(0, c.size - 1)
+        return c[idx]
+    }
+
+    // အပိုင်းတစ်ခုချင်းရဲ့ gender အရ အသံရွေး (မသိရင် မိန်းမအသံ)
+    private fun voiceOfPart(i: Int): VoicePreset = choiceFor(i < gender.size && gender[i] == 1)
+
+    private fun cycleVoice(male: Boolean) {
         if (ttsRunning) {
             Toast.makeText(this, "TTS ရပ်ပြီးမှ ပြောင်းပါ", Toast.LENGTH_SHORT).show()
             return
         }
-        val total = EdgeTts.presets.size + (if (customVoice.isNotBlank()) 1 else 0)
-        voiceIdx = (voiceIdx + 1) % total
+        val n = choices().size
+        if (male) maleIdx = (maleIdx + 1) % n else femaleIdx = (femaleIdx + 1) % n
         updateVoiceButtons()
         invalidateTts()
     }
@@ -361,27 +389,26 @@ class MainActivity : Activity() {
             .setView(e)
             .setPositiveButton("Save") { _, _ ->
                 customVoice = e.text.toString().trim()
-                voiceIdx = if (customVoice.isNotEmpty()) EdgeTts.presets.size else 0
+                maleIdx = maleIdx.coerceIn(0, choices().size - 1)
+                femaleIdx = femaleIdx.coerceIn(0, choices().size - 1)
                 updateVoiceButtons()
                 invalidateTts()
+                if (customVoice.isNotEmpty()) {
+                    Toast.makeText(this, "♂/♀ Voice ခလုတ်ကို နှိပ်ပြီး Custom ကို ရွေးပါ", Toast.LENGTH_LONG).show()
+                }
             }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-    private fun voiceId(): String =
-        if (voiceIdx < EdgeTts.presets.size) EdgeTts.presets[voiceIdx].id else customVoice
-
-    private fun voicePitch(): Int =
-        if (voiceIdx < EdgeTts.presets.size) EdgeTts.presets[voiceIdx].pitchHz else 0
-
     private fun voiceRatePct(): Int = Math.round((voiceSpeed - 1.0) * 100).toInt()
 
     private fun updateVoiceButtons() {
-        btnVoice.text = "Voice: " +
-            (if (voiceIdx < EdgeTts.presets.size) EdgeTts.presets[voiceIdx].label else "Custom")
+        btnVoiceM.text = "♂ " + choiceFor(true).label
+        btnVoiceF.text = "♀ " + choiceFor(false).label
         btnPause.text = "နားချိန်: " + pauseNames[pauseIdx]
         btnGain.text = String.format(Locale.US, "Volume: %.1fx", voiceGain)
+        btnSilent.text = String.format(Locale.US, "စကားမပါ speed: %.1fx", silentSpeed)
     }
 
     private fun invalidateTts() {
@@ -513,6 +540,9 @@ class MainActivity : Activity() {
         val id = loadId
         val segs = segments
         val tx = texts
+        val sps = spStart
+        val spe = spEnd
+        val gs = gender
         val n = transcribeWorkers
         val next = AtomicInteger(0)
         val finished = AtomicInteger(0)
@@ -526,11 +556,23 @@ class MainActivity : Activity() {
                     if (tx[i] != null) continue
                     try {
                         val bytes = readPcmBytes(pcm, segs[i])
-                        val text = if (bytes.size < 3200) ""
-                        else Deepgram.transcribe(key, Deepgram.wav(bytes))
+                        var text = ""
+                        var st = -1.0
+                        var en = -1.0
+                        var g = 0
+                        if (bytes.size >= 3200) {
+                            val r = Deepgram.transcribe(key, Deepgram.wav(bytes))
+                            text = r.text
+                            st = r.start
+                            en = r.end
+                            if (text.isNotBlank()) g = Pitch.guessGender(bytes, st, en)
+                        }
                         runOnUiThread {
                             if (id == loadId) {
                                 tx[i] = text
+                                sps[i] = st
+                                spe[i] = en
+                                if (gs[i] == 0) gs[i] = g
                                 refreshLabel(i)
                             }
                         }
@@ -579,19 +621,25 @@ class MainActivity : Activity() {
 
     private fun clipSec(i: Int) = (segments[i].endMs - segments[i].startMs) / 1000.0
 
-    // Gemini ကို ပေးမယ့် အချိန်ကန့်သတ်ချက် (video speed အရ ပြောခွင့်ရတဲ့ အချိန်)
-    private fun slotSec(i: Int) = clipSec(i) / videoSpeed
+    // စကားမစခင်ပိုင်း (အမြန်ပြမယ့်အပိုင်း)
+    private fun preSec(i: Int): Double =
+        if (i < spStart.size && !texts[i].isNullOrBlank()) preRollSec(clipSec(i), spStart[i]) else 0.0
 
-    private fun planOf(i: Int): ScenePlan = planScene(clipSec(i), ttsMs[i] / 1000.0, videoSpeed)
+    // Gemini ကို ပေးမယ့် အချိန်ကန့်သတ်ချက် (စကားစတဲ့နေရာကနေ video speed အရ ပြောခွင့်ရတဲ့ အချိန်)
+    private fun slotSec(i: Int) = (clipSec(i) - preSec(i)) / videoSpeed
+
+    private fun planOf(i: Int): ScenePlan =
+        planScene(clipSec(i) - preSec(i), ttsMs[i] / 1000.0, videoSpeed)
 
     private fun plan(i: Int): String {
-        val c = clipSec(i)
+        val body = clipSec(i) - preSec(i)
         val t = ttsMs[i] / 1000.0
         val p = planOf(i)
+        val total = preSec(i) / silentSpeed + p.dur
         val flag = if (p.vSpeed < 0.749) "  ⚠ စာရှည်နေသေး (တိုပါ)" else ""
         return String.format(
-            Locale.US, "🔊 %.1fs | video %.1fs→%.1fs (%.2fx) | အသံ %.2fx%s",
-            t, c, p.dur, p.vSpeed, p.aSpeed, flag
+            Locale.US, "🔊 %.1fs | video %.1fs→%.1fs (%.2fx) | အသံ %.2fx | ခန်းစုစုပေါင်း %.1fs%s",
+            t, body, p.dur, p.vSpeed, p.aSpeed, total, flag
         )
     }
 
@@ -599,10 +647,22 @@ class MainActivity : Activity() {
         val s = segments[i]
         val t = texts[i]
         val tr = trans[i]
-        var r = "[%03d]  %s - %s  (%.1fs)".format(
-            s.index, fmt(s.startMs), fmt(s.endMs), clipSec(i)
+        val gm = if (t.isNullOrBlank()) "" else when (gender[i]) {
+            1 -> " ♂"
+            2 -> " ♀"
+            else -> " ?"
+        }
+        var r = "[%03d]%s  %s - %s  (%.1fs)".format(
+            s.index, gm, fmt(s.startMs), fmt(s.endMs), clipSec(i)
         )
-        if (t != null) r += "\n" + (if (t.isBlank()) "(စကားမပါ)" else t)
+        if (t != null) {
+            if (t.isBlank()) {
+                val c = clipSec(i)
+                r += String.format(Locale.US, "\n(စကားမပါ) ⏩ %.1fs→%.1fs (%.1fx)", c, c / silentSpeed, silentSpeed)
+            } else {
+                r += "\n" + t
+            }
+        }
         if (!tr.isNullOrBlank()) r += "\n➜ " + tr
         if (i < ttsMs.size && ttsMs[i] > 0L) r += "\n" + plan(i)
         return r
@@ -637,7 +697,7 @@ The lines will be read aloud by a text-to-speech voice-over, so timing and clean
 
 Rules:
 1. Keep every part separate. Never merge, split or move lines between parts.
-2. Keep each header line exactly as given, including the times and the limit, for example [Part 3 • 00:20 - 00:25 • 3.8s • max 21 syllables].
+2. Keep each header line exactly as given, including the times, the limit and the speaker, for example [Part 3 • 00:20 - 00:25 • 3.8s • max 21 syllables • speaker: male].
 3. Under each header write only the translated spoken line, in Myanmar Unicode script. Write names and foreign words in Myanmar script too.
 4. No markdown, no speaker names, no notes, no explanations, no greetings.
 5. Separate the parts with this exact line: ----------------------------------------
@@ -652,8 +712,13 @@ Timing rules (very important):
 Text-to-speech rules (everything you write will be spoken aloud):
 11. Plain words only. No parentheses, brackets, ellipsis (...), emoji, symbols or stage directions.
 12. Use the Myanmar punctuation marks ၊ and ။ properly. The voice-over pauses at them. Put ၊ at every natural short pause inside a sentence (about every 6 to 12 syllables) and end every sentence with ။. Never write a long run-on line without them.
-13. Do not add words such as ရှင်, ရှင့်, ခင်ဗျာ, ဗျာ, ကွယ်, နော် (gender or politeness endings). Write neutral plain spoken sentences.
+13. Do not add words such as ရှင်, ရှင့်, ခင်ဗျာ, ဗျာ, ကွယ်, နော် (politeness endings). Write neutral plain spoken sentences.
 14. Do not add any word that is not part of the original meaning.
+
+Speaker rules (very important):
+15. Each header ends with "speaker: male", "speaker: female" or "speaker: unknown".
+16. Write each line the way that speaker really talks. A male speaker must use male first-person words (ကျွန်တော်, ကျနော်, ငါ, ကိုယ်) and must NEVER use female ones (ကျွန်မ, ကျမ). A female speaker uses female first-person words (ကျွန်မ, ကျမ, ငါ, ကိုယ်) and NEVER male ones. For unknown, avoid gendered first-person words where possible.
+17. Choose polite or casual speech from the relationship and mood of the scene, but never add the endings forbidden in rule 13.
 
 [ဇာတ်ကောင်စကားပြော စည်းကမ်းများ — မဖြစ်မနေ လိုက်နာရန်]
 ၁။ သဘာဝကျကျ စကားပြောဟန် ဖြစ်ရမည်: မှတ်တမ်းရုပ်ရှင် ဇာတ်ကြောင်းပြော (Narrator) သို့မဟုတ် အကျဉ်းချုပ်ပြောသလိုမျိုး မဟုတ်ဘဲ၊ ဇာတ်ကောင်တွေ အမှန်တကယ် ပြောဆိုနေကြသကဲ့သို့ သဘာဝကျပြီး ဒရမ်မာဆန်သော စကားပြောဟန် (Dramatic Character Dialogue) ဖြစ်ရပါမယ်။
@@ -673,9 +738,14 @@ Text-to-speech rules (everything you write will be spoken aloud):
             if (!t.isNullOrBlank()) {
                 val e = slotSec(i)
                 val maxSyl = maxOf(3, Math.round(e * sylPerSec * voiceSpeed).toInt())
+                val who = when (gender[i]) {
+                    1 -> "male"
+                    2 -> "female"
+                    else -> "unknown"
+                }
                 val head = String.format(
-                    Locale.US, "[Part %d • %s - %s • %.1fs • max %d syllables]",
-                    s.index, mmss(s.startMs), mmss(s.endMs), e, maxSyl
+                    Locale.US, "[Part %d • %s - %s • %.1fs • max %d syllables • speaker: %s]",
+                    s.index, mmss(s.startMs), mmss(s.endMs), e, maxSyl, who
                 )
                 parts.add("$head\n$t")
             }
@@ -746,10 +816,36 @@ Text-to-speech rules (everything you write will be spoken aloud):
         l2.setPadding(0, 24, 0, 0)
         val e2 = EditText(this)
         e2.setText(trans[i] ?: "")
+        val lg = TextView(this)
+        lg.text = "ပြောသူ (ယောက်ျား / မိန်းမ)"
+        lg.setPadding(0, 24, 0, 0)
+        val rg = RadioGroup(this)
+        rg.orientation = RadioGroup.HORIZONTAL
+        val rb0 = RadioButton(this)
+        rb0.text = "?"
+        rb0.id = View.generateViewId()
+        val rb1 = RadioButton(this)
+        rb1.text = "♂ ယောက်ျား"
+        rb1.id = View.generateViewId()
+        val rb2 = RadioButton(this)
+        rb2.text = "♀ မိန်းမ"
+        rb2.id = View.generateViewId()
+        rg.addView(rb0)
+        rg.addView(rb1)
+        rg.addView(rb2)
+        rg.check(
+            when (gender[i]) {
+                1 -> rb1.id
+                2 -> rb2.id
+                else -> rb0.id
+            }
+        )
         box.addView(l1)
         box.addView(e1)
         box.addView(l2)
         box.addView(e2)
+        box.addView(lg)
+        box.addView(rg)
         val sv = ScrollView(this)
         sv.addView(box)
         AlertDialog.Builder(this)
@@ -761,6 +857,20 @@ Text-to-speech rules (everything you write will be spoken aloud):
                 val newTr = if (t.isEmpty()) null else t
                 if (newTr != trans[i]) ttsMs[i] = 0L
                 trans[i] = newTr
+                val ng = when (rg.checkedRadioButtonId) {
+                    rb1.id -> 1
+                    rb2.id -> 2
+                    else -> 0
+                }
+                if (ng != gender[i]) {
+                    gender[i] = ng
+                    ttsMs[i] = 0L
+                    ttsFile(i).delete()
+                    Toast.makeText(
+                        this, "ပြောသူ ပြောင်းလို့ Copy All ပြန်လုပ်ပြီး Gemini မှာ ပြန်ခိုင်းပါ၊ ပြီးရင် TTS ပြန်ထုတ်ပါ",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
                 refreshLabel(i)
             }
             .setNeutralButton("▶ အသံ") { _, _ -> playTts(i) }
@@ -786,7 +896,6 @@ Text-to-speech rules (everything you write will be spoken aloud):
         try {
             p.setDataSource(f.absolutePath)
             p.prepare()
-            // Volume ကို မြှင့် (MediaPlayer.setVolume က 1.0 ထက် မကျော်နိုင်လို့)
             if (voiceGain > 1.001) {
                 try {
                     val e = LoudnessEnhancer(p.audioSessionId)
@@ -816,16 +925,16 @@ Text-to-speech rules (everything you write will be spoken aloud):
         playFile(ttsFile(i), planOf(i).aSpeed)
     }
 
-    private fun playSample() {
+    private fun playSample(male: Boolean) {
         if (sampling) return
-        val voice = voiceId()
-        if (voice.isBlank()) {
+        val vp = choiceFor(male)
+        if (vp.id.isBlank()) {
             Toast.makeText(this, "Voice ID မရှိပါ", Toast.LENGTH_SHORT).show()
             return
         }
         sampling = true
-        btnSample.text = "ထုတ်နေ..."
-        val pitch = voicePitch()
+        val b = if (male) btnSampleM else btnSampleF
+        b.text = "ထုတ်နေ..."
         val rate = voiceRatePct()
         val ps = pauseOpts[pauseIdx]
         Thread {
@@ -834,14 +943,15 @@ Text-to-speech rules (everything you write will be spoken aloud):
             try {
                 EdgeTts.speak(
                     "မင်္ဂလာပါ၊ ဒီအသံကို ကြားရပါသလား။ ဇာတ်လမ်းထဲက စကားပြောကို၊ အခုလို ဖတ်ပေးပါမယ်။",
-                    voice, pitch, rate, ps, f, cacheDir
+                    vp.id, vp.pitchHz, rate, ps, f, cacheDir
                 )
             } catch (e: Exception) {
                 err = e.message ?: e.toString()
             }
             runOnUiThread {
                 sampling = false
-                btnSample.text = "▶ နမူနာ"
+                btnSampleM.text = "▶ ♂ နမူနာ"
+                btnSampleF.text = "▶ ♀ နမူနာ"
                 if (err != null) {
                     Toast.makeText(this@MainActivity, "TTS error: $err", Toast.LENGTH_LONG).show()
                 } else {
@@ -858,11 +968,6 @@ Text-to-speech rules (everything you write will be spoken aloud):
             return
         }
         if (segments.isEmpty()) return
-        val voice = voiceId()
-        if (voice.isBlank()) {
-            Toast.makeText(this, "Voice ID မရှိပါ", Toast.LENGTH_SHORT).show()
-            return
-        }
         val all = segments.indices.filter { !trans[it].isNullOrBlank() }
         if (all.isEmpty()) {
             Toast.makeText(this, "မြန်မာ ဘာသာပြန် မရှိသေးပါ (Paste All အရင်လုပ်ပါ)", Toast.LENGTH_LONG).show()
@@ -876,12 +981,18 @@ Text-to-speech rules (everything you write will be spoken aloud):
             ).show()
             return
         }
+        // အပိုင်းတစ်ခုချင်းရဲ့ gender အရ အသံ
+        val vIds = Array(segments.size) { i -> voiceOfPart(i).id }
+        val vPitch = IntArray(segments.size) { i -> voiceOfPart(i).pitchHz }
+        if (todo.any { vIds[it].isBlank() }) {
+            Toast.makeText(this, "Voice ID မရှိပါ", Toast.LENGTH_SHORT).show()
+            return
+        }
         ttsRunning = true
         ttsStop = false
         updateTtsButton()
         val id = loadId
         val tr = trans
-        val pitch = voicePitch()
         val rate = voiceRatePct()
         val ps = pauseOpts[pauseIdx]
         val next = AtomicInteger(0)
@@ -899,7 +1010,7 @@ Text-to-speech rules (everything you write will be spoken aloud):
                     if (text.isEmpty()) continue
                     try {
                         val f = ttsFile(i)
-                        EdgeTts.speak(text, voice, pitch, rate, ps, f, cacheDir)
+                        EdgeTts.speak(text, vIds[i], vPitch[i], rate, ps, f, cacheDir)
                         val d = durationOf(f)
                         if (d <= 0L) throw RuntimeException("အသံဖိုင် မမှန်ပါ")
                         runOnUiThread {
@@ -965,12 +1076,23 @@ Text-to-speech rules (everything you write will be spoken aloud):
             return
         }
 
-        val segSnapshot = segments.toList()
+        // စကားစ/စကားဆုံး အချိန်တွေကို segment ထဲ ထည့်ပြီး ပို့
+        val segSnapshot = segments.mapIndexed { i, s ->
+            val st = spStart[i]
+            val en = spEnd[i]
+            if (!texts[i].isNullOrBlank() && st >= 0.0 && en > st)
+                s.copy(
+                    speechStartMs = s.startMs + (st * 1000).toLong(),
+                    speechEndMs = s.startMs + (en * 1000).toLong()
+                )
+            else s
+        }
         val textSnapshot = trans.copyOf()
         val fileSnapshot = segments.indices.map { i ->
             if (textSnapshot[i].isNullOrBlank()) null else ttsFile(i)
         }
         val vsSnapshot = videoSpeed
+        val silentSnapshot = silentSpeed
         val gainSnapshot = voiceGain
         exporting = true
         updateProgress()
@@ -978,7 +1100,7 @@ Text-to-speech rules (everything you write will be spoken aloud):
             try {
                 val savedUri = VideoExporter.export(
                     this@MainActivity, source, segSnapshot, textSnapshot, fileSnapshot,
-                    vsSnapshot, gainSnapshot
+                    vsSnapshot, silentSnapshot, gainSnapshot
                 )
                 runOnUiThread {
                     exporting = false
@@ -1087,6 +1209,9 @@ Text-to-speech rules (everything you write will be spoken aloud):
         texts = arrayOfNulls<String>(0)
         trans = arrayOfNulls<String>(0)
         ttsMs = LongArray(0)
+        spStart = DoubleArray(0)
+        spEnd = DoubleArray(0)
+        gender = IntArray(0)
         pcmFile = null
         labels.clear()
         adapter.notifyDataSetChanged()
@@ -1128,11 +1253,11 @@ Text-to-speech rules (everything you write will be spoken aloud):
         Thread {
             var db = FloatArray(0)
             try {
-                db = decodeAudio(uri, pcm)
+                db = AudioAnalyzer.decode(this, uri, pcm)
             } catch (e: Exception) { }
-            val smart = buildSegments(db, totalMs)
+            val smart = AudioAnalyzer.buildSegments(db, totalMs)
             val usedSmart = smart.isNotEmpty()
-            val result = if (usedSmart) smart else fixedSegments(totalMs)
+            val result = if (usedSmart) smart else AudioAnalyzer.fixedSegments(totalMs)
             val mode = if (usedSmart) "pause အလိုက်" else "၁၃ စက္ကန့်စီ"
             val hasPcm = db.isNotEmpty()
             runOnUiThread {
@@ -1150,6 +1275,9 @@ Text-to-speech rules (everything you write will be spoken aloud):
         texts = arrayOfNulls<String>(segs.size)
         trans = arrayOfNulls<String>(segs.size)
         ttsMs = LongArray(segs.size)
+        spStart = DoubleArray(segs.size) { -1.0 }
+        spEnd = DoubleArray(segs.size) { -1.0 }
+        gender = IntArray(segs.size)
         labels.clear()
         for (i in segs.indices) labels.add(label(i))
         adapter.notifyDataSetChanged()
@@ -1160,203 +1288,6 @@ Text-to-speech rules (everything you write will be spoken aloud):
             this, "$head | Segments: ${segs.size} | $mode\n(စာကို ကြာကြာနှိပ်ရင် ပြင်လို့ရ)",
             Toast.LENGTH_LONG
         ).show()
-    }
-
-    private fun fixedSegments(totalMs: Long): List<Segment> {
-        val step = 13_000L
-        return (0L until totalMs step step).mapIndexed { i, s ->
-            Segment(i + 1, s, minOf(s + step, totalMs))
-        }
-    }
-
-    private fun decodeAudio(uri: Uri, outFile: File): FloatArray {
-        val ex = MediaExtractor()
-        ex.setDataSource(this, uri, null)
-        var track = -1
-        var af: MediaFormat? = null
-        for (i in 0 until ex.trackCount) {
-            val f = ex.getTrackFormat(i)
-            if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
-                track = i
-                af = f
-                break
-            }
-        }
-        if (track < 0 || af == null) {
-            ex.release()
-            return FloatArray(0)
-        }
-        ex.selectTrack(track)
-        val codec = MediaCodec.createDecoderByType(af.getString(MediaFormat.KEY_MIME)!!)
-        codec.configure(af, null, null, 0)
-        codec.start()
-
-        var ch = af.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-        var ratio = af.getInteger(MediaFormat.KEY_SAMPLE_RATE) / 16000.0
-        var phase = 0.0
-        var accSum = 0.0
-        var accCnt = 0
-        var chSum = 0
-        var chIdx = 0
-        var frameSum = 0.0
-        var frameN = 0
-        val db = ArrayList<Float>()
-        val os = FileOutputStream(outFile)
-        val obuf = ByteArray(1 shl 16)
-        var opos = 0
-
-        val bi = MediaCodec.BufferInfo()
-        var inputDone = false
-        var outputDone = false
-        while (!outputDone) {
-            if (!inputDone) {
-                val ii = codec.dequeueInputBuffer(10_000)
-                if (ii >= 0) {
-                    val buf = codec.getInputBuffer(ii)!!
-                    val size = ex.readSampleData(buf, 0)
-                    if (size < 0) {
-                        codec.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                        inputDone = true
-                    } else {
-                        codec.queueInputBuffer(ii, 0, size, ex.sampleTime, 0)
-                        ex.advance()
-                    }
-                }
-            }
-            val oi = codec.dequeueOutputBuffer(bi, 10_000)
-            if (oi >= 0) {
-                val buf = codec.getOutputBuffer(oi)!!
-                buf.position(bi.offset)
-                buf.limit(bi.offset + bi.size)
-                val sb = buf.order(ByteOrder.nativeOrder()).asShortBuffer()
-                while (sb.hasRemaining()) {
-                    chSum += sb.get().toInt()
-                    chIdx++
-                    if (chIdx >= ch) {
-                        val m = chSum / ch
-                        chSum = 0
-                        chIdx = 0
-                        accSum += m
-                        accCnt++
-                        phase += 1.0
-                        if (phase >= ratio) {
-                            phase -= ratio
-                            val v = (accSum / accCnt).toInt().coerceIn(-32768, 32767)
-                            accSum = 0.0
-                            accCnt = 0
-                            obuf[opos++] = v.toByte()
-                            obuf[opos++] = (v shr 8).toByte()
-                            if (opos >= obuf.size) {
-                                os.write(obuf, 0, opos)
-                                opos = 0
-                            }
-                            val f = v / 32768.0
-                            frameSum += f * f
-                            frameN++
-                            if (frameN >= 800) {
-                                db.add((10.0 * log10(maxOf(frameSum / frameN, 1e-10))).toFloat())
-                                frameSum = 0.0
-                                frameN = 0
-                            }
-                        }
-                    }
-                }
-                codec.releaseOutputBuffer(oi, false)
-                if ((bi.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true
-            } else if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                val nf = codec.outputFormat
-                ch = nf.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                ratio = nf.getInteger(MediaFormat.KEY_SAMPLE_RATE) / 16000.0
-            }
-        }
-        if (opos > 0) os.write(obuf, 0, opos)
-        os.close()
-        codec.stop()
-        codec.release()
-        ex.release()
-        return db.toFloatArray()
-    }
-
-    private fun buildSegments(db: FloatArray, totalMs: Long): List<Segment> {
-        val n = db.size
-        if (n < 20) return emptyList()
-        val sorted = db.sortedArray()
-        val floor = sorted[(n * 0.2).toInt()]
-        val ceil = sorted[minOf(n - 1, (n * 0.9).toInt())]
-        val thr = floor + (ceil - floor) * 0.25f
-        val maxF = maxMs / frameMs
-        val minGap = 350 / frameMs
-        val strongGap = 700 / frameMs
-        val skipF = skipGapMs / frameMs
-        val minLen = 40
-
-        val gaps = ArrayList<IntArray>()
-        var i = 0
-        while (i < n) {
-            if (db[i] <= thr) {
-                var j = i
-                while (j < n && db[j] <= thr) j++
-                if (j - i >= minGap) gaps.add(intArrayOf(i, j))
-                i = j
-            } else {
-                i++
-            }
-        }
-
-        var s = 0
-        while (s < n && db[s] <= thr) s++
-        if (s >= n) return emptyList()
-        s = if (s <= skipF) 0 else maxOf(0, s - 4)
-
-        val cuts = ArrayList<IntArray>()
-        while (s < n) {
-            if (n - s <= maxF) {
-                cuts.add(intArrayOf(s, n))
-                break
-            }
-            val limit = s + maxF
-            var best: IntArray? = null
-            for (g in gaps) {
-                if (g[0] <= s + minLen || g[0] >= limit) continue
-                if (g[1] - g[0] >= strongGap) best = g
-            }
-            if (best == null) {
-                for (g in gaps) {
-                    if (g[0] <= s + minLen || g[0] >= limit) continue
-                    best = g
-                }
-            }
-            val end: Int
-            val next: Int
-            if (best != null) {
-                val len = best[1] - best[0]
-                if (len > skipF) {
-                    end = best[0] + 4
-                    next = best[1] - 4
-                } else {
-                    end = best[0] + len / 2
-                    next = end
-                }
-            } else {
-                var c = limit
-                for (k in (limit - 60)..limit) {
-                    if (k > s + minLen && db[k] < db[c]) c = k
-                }
-                end = c
-                next = c
-            }
-            cuts.add(intArrayOf(s, end))
-            s = next
-        }
-
-        return cuts.mapIndexed { idx, c ->
-            val last = idx == cuts.lastIndex
-            Segment(
-                idx + 1,
-                c[0].toLong() * frameMs,
-                if (last) totalMs else minOf(totalMs, c[1].toLong() * frameMs)
-            )
-        }
     }
 
     private fun playSegment(s: Segment) {
