@@ -10,12 +10,14 @@ import java.io.FileOutputStream
 import java.nio.ByteOrder
 import kotlin.math.log10
 
+/** gender: 0 = မသိ/စကားမပါ၊ 1 = ယောက်ျား၊ 2 = မိန်းမ */
 data class Segment(
     val index: Int,
     val startMs: Long,
     val endMs: Long,
     val speechStartMs: Long = startMs,
-    val speechEndMs: Long = endMs
+    val speechEndMs: Long = endMs,
+    val gender: Int = 0
 )
 
 object AudioAnalyzer {
@@ -23,11 +25,32 @@ object AudioAnalyzer {
     private const val MAX_MS = 15_000
     private const val SKIP_GAP_MS = 3_000
 
+    private const val MIN_RUN = 10        // 0.5s အောက် gender အပိုင်းတို ဖယ်
+    private const val BRIDGE = 50         // 2.5s အတွင်း အသံတူ နားတာကို မဖြတ်
+    private const val MAX_SPEECH = 1200   // အပိုင်းတစ်ခု အများဆုံး 60s
+    private const val END_PAD = 5         // စကားအဆုံး 0.25s ထပ်ယူ
+    private const val START_PAD = 3       // စကားအစ 0.15s ကြိုယူ
+    private const val MIN_NS = 20         // စကားမပါ ခန်း အနည်းဆုံး 1s
+    private const val SKIP_FRAMES = 60    // တိတ်ဆိတ် 3s ကျော်ရင် ဖယ်
+    private const val NS_CHUNK = 300      // စကားမပါ ခန်း အများဆုံး 15s
+    private const val SMOOTH = 8
+    private const val SPLIT_HZ = 165f
+
     fun fixedSegments(totalMs: Long): List<Segment> {
         val step = 13_000L
         return (0L until totalMs step step).mapIndexed { i, s ->
             Segment(i + 1, s, minOf(s + step, totalMs))
         }
+    }
+
+    /** အသံပြည့်/တိတ် ခွဲတဲ့ threshold (dB) */
+    fun threshold(db: FloatArray): Float {
+        val n = db.size
+        if (n == 0) return 0f
+        val sorted = db.sortedArray()
+        val floor = sorted[(n * 0.2).toInt()]
+        val ceil = sorted[minOf(n - 1, (n * 0.9).toInt())]
+        return floor + (ceil - floor) * 0.25f
     }
 
     /** အသံကို decode → 16kHz mono PCM ဖိုင်ထုတ် + 50ms frame တစ်ခုချင်းရဲ့ volume (dB) ပြန်ပေး */
@@ -139,13 +162,139 @@ object AudioAnalyzer {
         return db.toFloatArray()
     }
 
+    private class Run(var g: Int, var s: Int, var e: Int)
+
+    /**
+     * ယောက်ျား/မိန်းမ အလိုက်ဖြတ်။ f0 = Pitch.frameF0 ရလဒ်။
+     * သတ်မှတ်လို့မရရင် (voice နည်းလွန်း) empty ပြန် → pause အလိုက်နည်းကို သုံး။
+     */
+    fun buildByGender(db: FloatArray, f0: FloatArray, totalMs: Long): List<Segment> {
+        val n = db.size
+        if (n < 40 || f0.size != n) return emptyList()
+        val thr = threshold(db)
+
+        // 1) frame တစ်ခုချင်း gender label (±0.4s အတွင်း pitch အလယ်တန်ဖိုး)
+        val label = IntArray(n)
+        val tmp = FloatArray(2 * SMOOTH + 1)
+        for (t in 0 until n) {
+            if (db[t] <= thr) continue
+            var c = 0
+            for (k in maxOf(0, t - SMOOTH)..minOf(n - 1, t + SMOOTH)) {
+                if (f0[k] > 0f) tmp[c++] = f0[k]
+            }
+            if (c < 3) continue
+            java.util.Arrays.sort(tmp, 0, c)
+            label[t] = if (tmp[c / 2] < SPLIT_HZ) 1 else 2
+        }
+
+        // 2) label တူတဲ့ ဆက်တိုက် run တွေ → တိုလွန်းတာ ဖယ် → gender တူ၊ နားချိန်တိုရင် ပေါင်း
+        val runs = ArrayList<Run>()
+        var t = 0
+        while (t < n) {
+            if (label[t] == 0) {
+                t++
+                continue
+            }
+            val g = label[t]
+            var u = t
+            while (u < n && label[u] == g) u++
+            runs.add(Run(g, t, u))
+            t = u
+        }
+        val spans = ArrayList<Run>()
+        for (r in runs) {
+            if (r.e - r.s < MIN_RUN) continue
+            val last = spans.lastOrNull()
+            if (last != null && last.g == r.g && r.s - last.e <= BRIDGE) last.e = r.e
+            else spans.add(Run(r.g, r.s, r.e))
+        }
+        if (spans.isEmpty()) return emptyList()
+
+        // 3) 60s ထက်ရှည်ရင် အသံအတိတ်ဆုံးနေရာမှာ ဖြတ်
+        val capped = ArrayList<Run>()
+        for (sp in spans) {
+            var s = sp.s
+            while (sp.e - s > MAX_SPEECH) {
+                var cut = s + MAX_SPEECH
+                val lo = maxOf(s + MAX_SPEECH - 200, s + 40)
+                for (k in lo..cut) {
+                    if (db[k] < db[cut]) cut = k
+                }
+                capped.add(Run(sp.g, s, cut))
+                s = cut
+            }
+            capped.add(Run(sp.g, s, sp.e))
+        }
+
+        // 4) စကားပြောပိုင်းတွေကြားက gap ကို စီမံ
+        val pieces = ArrayList<Run>()
+        var lastSpeech: Run? = null
+        var gapStart = 0
+        for (i in 0..capped.size) {
+            val next = capped.getOrNull(i)
+            val gapEnd = next?.s ?: n
+            val len = gapEnd - gapStart
+            val prev = lastSpeech
+            var nextStart = gapEnd
+            if (len > 0) {
+                val padE = if (prev != null) minOf(END_PAD, len / 2) else 0
+                val padS = if (next != null) minOf(START_PAD, len - padE) else 0
+                if (prev != null) prev.e += padE
+                val a = gapStart + padE
+                val b = gapEnd - padS
+                nextStart = b
+                val rem = b - a
+                if (rem > 0) {
+                    var sound = 0
+                    for (k in a until b) {
+                        if (db[k] > thr) sound++
+                    }
+                    if (rem >= MIN_NS && sound * 10 >= rem * 3) {
+                        // အသံရှိပေမဲ့ စကားမပါ → သီးသန့်ခန်း (၁၅ စက္ကန့်ထက် မရှည်စေ)
+                        val parts = (rem + NS_CHUNK - 1) / NS_CHUNK
+                        for (p in 0 until parts) {
+                            pieces.add(Run(0, a + rem * p / parts, a + rem * (p + 1) / parts))
+                        }
+                    } else if (rem >= SKIP_FRAMES) {
+                        // တိတ်ဆိတ်ရှည် → ဖယ်
+                    } else {
+                        // တိုတဲ့ တိတ်ဆိတ်/အသံ → အနီးက စကားပြောပိုင်းနဲ့ ပေါင်း
+                        if (prev != null && next != null) {
+                            val m = a + rem / 2
+                            prev.e = m
+                            nextStart = m
+                        } else if (prev != null) {
+                            prev.e = b
+                        } else if (next != null) {
+                            nextStart = a
+                        }
+                    }
+                }
+            }
+            if (next != null) {
+                val piece = Run(next.g, nextStart, next.e)
+                pieces.add(piece)
+                lastSpeech = piece
+                gapStart = next.e
+            }
+        }
+
+        val out = ArrayList<Segment>()
+        for (p in pieces) {
+            if (p.e - p.s < 4) continue
+            val sMs = p.s.toLong() * FRAME_MS
+            val eMs = if (p.e >= n) totalMs else minOf(totalMs, p.e.toLong() * FRAME_MS)
+            if (eMs - sMs < 150) continue
+            out.add(Segment(out.size + 1, sMs, eMs, sMs, eMs, p.g))
+        }
+        return out
+    }
+
+    /** gender မသိတဲ့ အခြေအနေအတွက် အရင်နည်း (pause အလိုက်၊ ၁၅ စက္ကန့်အတွင်း) */
     fun buildSegments(db: FloatArray, totalMs: Long): List<Segment> {
         val n = db.size
         if (n < 20) return emptyList()
-        val sorted = db.sortedArray()
-        val floor = sorted[(n * 0.2).toInt()]
-        val ceil = sorted[minOf(n - 1, (n * 0.9).toInt())]
-        val thr = floor + (ceil - floor) * 0.25f
+        val thr = threshold(db)
         val maxF = MAX_MS / FRAME_MS
         val minGap = 350 / FRAME_MS
         val strongGap = 700 / FRAME_MS
