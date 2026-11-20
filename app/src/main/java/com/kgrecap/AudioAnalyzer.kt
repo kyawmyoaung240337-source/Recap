@@ -164,6 +164,51 @@ object AudioAnalyzer {
 
     private class Run(var g: Int, var s: Int, var e: Int)
 
+        /** [a,b) ထဲက အသံကျွန်း (≥0.25s) တွေကို ရှာ၊ 0.6s အတွင်း ဆက်နေရင် ပေါင်း */
+    private fun islands(db: FloatArray, thr: Float, a: Int, b: Int): List<IntArray> {
+        val raw = ArrayList<IntArray>()
+        var k = a
+        while (k < b) {
+            if (db[k] > thr) {
+                var j = k
+                while (j < b && db[j] > thr) j++
+                if (j - k >= 5) raw.add(intArrayOf(k, j))
+                k = j
+            } else {
+                k++
+            }
+        }
+        val out = ArrayList<IntArray>()
+        for (r in raw) {
+            val last = out.lastOrNull()
+            if (last != null && r[0] - last[1] <= 12) last[1] = r[1] else out.add(intArrayOf(r[0], r[1]))
+        }
+        return out
+    }
+
+    private fun hasIsland(db: FloatArray, thr: Float, a: Int, b: Int): Boolean =
+        islands(db, thr, a, b).isNotEmpty()
+
+    /** တိုတဲ့ gap (3s အောက်) ဆို gap တစ်ခုလုံး၊ ရှည်ရင် အသံကျွန်းတွေကိုပဲ (±0.4s) */
+    private fun soundRanges(db: FloatArray, thr: Float, a: Int, b: Int): List<IntArray> {
+        if (b - a < SKIP_FRAMES) return listOf(intArrayOf(a, b))
+        val out = ArrayList<IntArray>()
+        for (r in islands(db, thr, a, b)) {
+            val s = maxOf(a, r[0] - 8)
+            val e = minOf(b, r[1] + 8)
+            val last = out.lastOrNull()
+            if (last != null && s <= last[1]) last[1] = e else out.add(intArrayOf(s, e))
+        }
+        return out
+    }
+
+    private fun addChunks(out: MutableList<Run>, s: Int, e: Int) {
+        val len = e - s
+        if (len < 4) return
+        val parts = (len + NS_CHUNK - 1) / NS_CHUNK
+        for (p in 0 until parts) out.add(Run(0, s + len * p / parts, s + len * (p + 1) / parts))
+    }
+
     /**
      * ယောက်ျား/မိန်းမ အလိုက်ဖြတ်။ f0 = Pitch.frameF0 ရလဒ်။
      * သတ်မှတ်လို့မရရင် (voice နည်းလွန်း) empty ပြန် → pause အလိုက်နည်းကို သုံး။
@@ -249,12 +294,9 @@ object AudioAnalyzer {
                     for (k in a until b) {
                         if (db[k] > thr) sound++
                     }
-                    if (rem >= MIN_NS && sound * 10 >= rem * 3) {
+                                        if (rem >= MIN_NS && hasIsland(db, thr, a, b)) {
                         // အသံရှိပေမဲ့ စကားမပါ → သီးသန့်ခန်း (၁၅ စက္ကန့်ထက် မရှည်စေ)
-                        val parts = (rem + NS_CHUNK - 1) / NS_CHUNK
-                        for (p in 0 until parts) {
-                            pieces.add(Run(0, a + rem * p / parts, a + rem * (p + 1) / parts))
-                        }
+                                                for (r in soundRanges(db, thr, a, b)) addChunks(pieces, r[0], r[1])
                     } else if (rem >= SKIP_FRAMES) {
                         // တိတ်ဆိတ်ရှည် → ဖယ်
                     } else {
