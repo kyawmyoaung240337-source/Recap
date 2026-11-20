@@ -8,6 +8,9 @@ import java.nio.ByteOrder
 
 class DeepgramException(val code: Int, msg: String) : Exception(msg)
 
+/** start/end = clip ထဲက စကားစ/စကားဆုံး စက္ကန့် (စကားမပါရင် -1) */
+class Transcript(val text: String, val start: Double, val end: Double)
+
 object Deepgram {
     private const val BASE = "https://api.deepgram.com/v1"
 
@@ -54,7 +57,7 @@ object Deepgram {
         return h.array() + pcm
     }
 
-    fun transcribe(key: String, wav: ByteArray): String {
+    fun transcribe(key: String, wav: ByteArray): Transcript {
         var attempt = 0
         while (true) {
             attempt++
@@ -68,7 +71,7 @@ object Deepgram {
         }
     }
 
-    private fun once(key: String, wav: ByteArray): String {
+    private fun once(key: String, wav: ByteArray): Transcript {
         var c: HttpURLConnection? = null
         try {
             val url = URL("$BASE/listen?model=nova-3&language=multi&smart_format=true&punctuate=true")
@@ -95,12 +98,20 @@ object Deepgram {
         }
     }
 
-    private fun parse(body: String): String {
+    private fun parse(body: String): Transcript {
         try {
             val alt = JSONObject(body).getJSONObject("results")
                 .getJSONArray("channels").getJSONObject(0)
                 .getJSONArray("alternatives").getJSONObject(0)
-            return alt.optString("transcript", "").trim()
+            val text = alt.optString("transcript", "").trim()
+            val words = alt.optJSONArray("words")
+            var st = -1.0
+            var en = -1.0
+            if (text.isNotEmpty() && words != null && words.length() > 0) {
+                st = words.getJSONObject(0).optDouble("start", -1.0)
+                en = words.getJSONObject(words.length() - 1).optDouble("end", -1.0)
+            }
+            return Transcript(text, st, en)
         } catch (e: Exception) {
             throw DeepgramException(-2, "Deepgram ပြန်စာ မှန်ကန်မှုမရှိပါ: ${body.take(120)}")
         }
