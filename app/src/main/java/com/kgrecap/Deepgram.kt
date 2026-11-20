@@ -5,6 +5,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.sqrt
 
 class DeepgramException(val code: Int, msg: String) : Exception(msg)
 
@@ -13,6 +14,7 @@ class Transcript(val text: String, val start: Double, val end: Double)
 
 object Deepgram {
     private const val BASE = "https://api.deepgram.com/v1"
+    @Volatile private var dominant: String? = null
 
     /** null = key အလုပ်လုပ်တယ်၊ တခြားဆို error စာ */
     fun validate(key: String): String? {
@@ -58,11 +60,52 @@ object Deepgram {
     }
 
     fun transcribe(key: String, wav: ByteArray): Transcript {
+        val first = call(key, wav, "model=nova-3&language=multi")
+        if (first.first.text.isNotBlank()) {
+            val l = first.second
+            if (!l.isNullOrBlank() && dominant == null) dominant = l
+            return first.first
+        }
+        // စာမထွက် → အသံတကယ်ရှိရင် ဘာသာစကားတစ်မျိုးချင်း ထပ်စမ်း
+        if (rms(wav) < 0.004) return first.first
+        val tries = ArrayList<String>()
+        dominant?.let { tries.add("model=nova-3&language=$it") }
+        tries.add("model=nova-3-general&detect_language=true")
+        for (q in tries) {
+            try {
+                val r = call(key, wav, q)
+                if (r.first.text.isNotBlank()) {
+                    val l = r.second
+                    if (!l.isNullOrBlank()) dominant = l
+                    return r.first
+                }
+            } catch (e: DeepgramException) {
+                if (e.code == 400 || e.code == 422) continue
+                throw e
+            }
+        }
+        return first.first
+    }
+
+    private fun rms(wav: ByteArray): Double {
+        var s = 0.0
+        var c = 0
+        var i = 44
+        while (i + 1 < wav.size) {
+            val v = ((wav[i + 1].toInt() shl 8) or (wav[i].toInt() and 0xFF)) / 32768.0
+            s += v * v
+            c++
+            i += 2
+        }
+        return if (c == 0) 0.0 else sqrt(s / c)
+    }
+
+    private fun call(key: String, wav: ByteArray, query: String): Pair<Transcript, String?> {
         var attempt = 0
         while (true) {
             attempt++
             try {
-                return once(key, wav)
+                return once(key, wav, query)
             } catch (e: DeepgramException) {
                 val retry = e.code == 429 || e.code >= 500 || e.code == -1
                 if (!retry || attempt >= 3) throw e
@@ -71,10 +114,10 @@ object Deepgram {
         }
     }
 
-    private fun once(key: String, wav: ByteArray): Transcript {
+    private fun once(key: String, wav: ByteArray, query: String): Pair<Transcript, String?> {
         var c: HttpURLConnection? = null
         try {
-            val url = URL("$BASE/listen?model=nova-3&language=multi&smart_format=true&punctuate=true")
+            val url = URL("$BASE/listen?$query&smart_format=true&punctuate=true")
             c = url.openConnection() as HttpURLConnection
             c.requestMethod = "POST"
             c.doOutput = true
@@ -98,11 +141,11 @@ object Deepgram {
         }
     }
 
-    private fun parse(body: String): Transcript {
+    private fun parse(body: String): Pair<Transcript, String?> {
         try {
-            val alt = JSONObject(body).getJSONObject("results")
+            val ch = JSONObject(body).getJSONObject("results")
                 .getJSONArray("channels").getJSONObject(0)
-                .getJSONArray("alternatives").getJSONObject(0)
+            val alt = ch.getJSONArray("alternatives").getJSONObject(0)
             val text = alt.optString("transcript", "").trim()
             val words = alt.optJSONArray("words")
             var st = -1.0
@@ -111,7 +154,12 @@ object Deepgram {
                 st = words.getJSONObject(0).optDouble("start", -1.0)
                 en = words.getJSONObject(words.length() - 1).optDouble("end", -1.0)
             }
-            return Transcript(text, st, en)
+            var lang: String? = null
+            val ls = alt.optJSONArray("languages")
+            if (ls != null && ls.length() > 0) lang = ls.optString(0, "")
+            if (lang.isNullOrBlank()) lang = ch.optString("detected_language", "")
+            val l = lang?.takeIf { it.isNotBlank() }
+            return Pair(Transcript(text, st, en), l)
         } catch (e: Exception) {
             throw DeepgramException(-2, "Deepgram ပြန်စာ မှန်ကန်မှုမရှိပါ: ${body.take(120)}")
         }
