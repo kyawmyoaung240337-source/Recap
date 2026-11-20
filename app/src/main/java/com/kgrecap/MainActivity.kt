@@ -487,7 +487,11 @@ class MainActivity : Activity() {
             n == 0 -> "Transcribe (Video ရွေးပါ)"
             d == 0 -> "Transcribe စတင်မယ်"
             d < n -> "ဆက်လုပ်မယ် $d/$n (ကျန် ${n - d})"
-            else -> "စာထုတ်ပြီး $d/$n ✓"
+                        else -> {
+                val blank = texts.count { it != null && it.isBlank() }
+                if (blank > 0) "စာထုတ်ပြီး $d/$n ✓\nစကားမပါ $blank ခန်း ပြန်စစ်မယ်"
+                else "စာထုတ်ပြီး $d/$n ✓"
+            }
         }
     }
 
