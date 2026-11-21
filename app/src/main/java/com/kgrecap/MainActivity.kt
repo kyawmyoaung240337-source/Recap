@@ -1261,7 +1261,7 @@ Speaker rules (very important):
                 db = AudioAnalyzer.decode(this, uri, pcm)
             } catch (e: Exception) { }
 
-            var result: List<Segment> = emptyList()
+                        var result: List<Segment> = emptyList()
             var mode = ""
             if (db.isNotEmpty()) {
                 try {
