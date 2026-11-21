@@ -21,8 +21,9 @@ import android.widget.TextView
 /**
  * Preview ပေါ်မှာ အုပ်ထားတဲ့ အလွှာ: Blur ၂ ကွက် + စာတန်း (လက်နဲ့ဆွဲရွှေ့)၊
  * ဘယ်အပေါ်ထောင့်မှာ ခလုတ်တန်း၊ Blur density slider။
+ * (နာမည် "ov" သုံးထား: Android View မှာ getOverlay() ပါပြီးသားမို့ "overlay" နဲ့ ထိတိုက်လို့)
  */
-class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx) {
+class OverlayLayer(ctx: Context, private val ov: Overlay) : FrameLayout(ctx) {
     private val sample = "မင်္ဂလာပါ၊ ဒီစာတန်းပုံစံကို ကြည့်ပါ။"
     private var vw = 0
     private var vh = 0
@@ -95,8 +96,8 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
         bBlur[1].setOnClickListener { toggleBlur(1) }
         bStyle.setOnClickListener { openStyle() }
         bShow.setOnClickListener {
-            overlay.caption.show = !overlay.caption.show
-            save()
+            ov.caption.show = !ov.caption.show
+            persist()
             refreshButtons()
             canvasView.invalidate()
         }
@@ -104,13 +105,13 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
         seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
                 if (!fromUser || selKind != 0) return
-                overlay.blurs[selIndex].density = p
+                ov.blurs[selIndex].density = p
                 seekLabel.text = "Blur ${selIndex + 1} density: $p%"
                 canvasView.invalidate()
             }
             override fun onStartTrackingTouch(sb: SeekBar) {}
             override fun onStopTrackingTouch(sb: SeekBar) {
-                save()
+                persist()
             }
         })
         refreshButtons()
@@ -127,20 +128,20 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
         canvasView.invalidateCaption()
     }
 
-    private fun save() = overlay.save(context)
+    private fun persist() = ov.save(context)
 
     private fun refreshButtons() {
         val on = 0xCC2E7D32.toInt()
         val off = 0xCC37474F.toInt()
-        bBlur[0].setBackgroundColor(if (overlay.blurs[0].on) on else off)
-        bBlur[1].setBackgroundColor(if (overlay.blurs[1].on) on else off)
-        bShow.setBackgroundColor(if (overlay.caption.show) on else off)
+        bBlur[0].setBackgroundColor(if (ov.blurs[0].on) on else off)
+        bBlur[1].setBackgroundColor(if (ov.blurs[1].on) on else off)
+        bShow.setBackgroundColor(if (ov.caption.show) on else off)
         bStyle.setBackgroundColor(0xCC1565C0.toInt())
         bReset.setBackgroundColor(off)
     }
 
     private fun toggleBlur(i: Int) {
-        val b = overlay.blurs[i]
+        val b = ov.blurs[i]
         b.on = !b.on
         if (b.on) {
             select(0, i)
@@ -150,7 +151,7 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
         updateSeekUi()
         refreshButtons()
         canvasView.invalidate()
-        save()
+        persist()
     }
 
     private fun select(kind: Int, idx: Int) {
@@ -161,10 +162,10 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
     }
 
     private fun updateSeekUi() {
-        if (selKind == 0 && overlay.blurs[selIndex].on) {
+        if (selKind == 0 && ov.blurs[selIndex].on) {
             seekBox.visibility = View.VISIBLE
-            seek.progress = overlay.blurs[selIndex].density
-            seekLabel.text = "Blur ${selIndex + 1} density: ${overlay.blurs[selIndex].density}%"
+            seek.progress = ov.blurs[selIndex].density
+            seekLabel.text = "Blur ${selIndex + 1} density: ${ov.blurs[selIndex].density}%"
         } else {
             seekBox.visibility = View.GONE
         }
@@ -173,23 +174,23 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
     private fun resetPositions() {
         val d = Overlay.defaults()
         for (i in 0..1) {
-            val b = overlay.blurs[i]
+            val b = ov.blurs[i]
             val s = d.blurs[i]
             b.x = s.x
             b.y = s.y
             b.w = s.w
             b.h = s.h
         }
-        overlay.caption.cx = d.caption.cx
-        overlay.caption.cy = d.caption.cy
-        save()
+        ov.caption.cx = d.caption.cx
+        ov.caption.cy = d.caption.cy
+        persist()
         canvasView.invalidate()
     }
 
     private fun openStyle() {
         val a = context as? Activity ?: return
-        StyleDialog.show(a, overlay, if (captionText.isBlank()) sample else captionText) {
-            save()
+        StyleDialog.show(a, ov, if (captionText.isBlank()) sample else captionText) {
+            persist()
             canvasView.invalidateCaption()
         }
     }
@@ -253,7 +254,7 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
         private fun handleSize(r: RectF): Float = minOf(dp(28f), minOf(r.width(), r.height()) / 2f)
 
         private fun captionBitmap(): Bitmap? {
-            val st = overlay.caption
+            val st = ov.caption
             if (!st.show) return null
             val text = if (captionText.isBlank()) sample else captionText
             val cw = content.width().toInt()
@@ -269,7 +270,7 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
 
         private fun captionRect(): RectF? {
             val b = captionBitmap() ?: return null
-            val st = overlay.caption
+            val st = ov.caption
             var l = content.left + st.cx * content.width() - b.width / 2f
             var t = content.top + st.cy * content.height() - b.height / 2f
             l = l.coerceIn(content.left, maxOf(content.left, content.right - b.width))
@@ -280,7 +281,7 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
         override fun onDraw(c: Canvas) {
             computeContent()
             for (i in 0..1) {
-                val b = overlay.blurs[i]
+                val b = ov.blurs[i]
                 if (!b.on) continue
                 val r = blurRect(b)
                 val sel = selKind == 0 && selIndex == i
@@ -306,29 +307,29 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     computeContent()
-                    val x = e.x
-                    val y = e.y
+                    val tx = e.x
+                    val ty = e.y
                     mode = 0
                     val cr = captionRect()
-                    if (cr != null && cr.contains(x, y)) {
+                    if (cr != null && cr.contains(tx, ty)) {
                         dragKind = 1
                         dragIdx = 0
                         mode = 1
                         select(1, 0)
                     } else {
                         for (i in 1 downTo 0) {
-                            val b = overlay.blurs[i]
+                            val b = ov.blurs[i]
                             if (!b.on) continue
                             val r = blurRect(b)
                             val hs = handleSize(r)
-                            if (RectF(r.right - hs, r.bottom - hs, r.right, r.bottom).contains(x, y)) {
+                            if (RectF(r.right - hs, r.bottom - hs, r.right, r.bottom).contains(tx, ty)) {
                                 dragKind = 0
                                 dragIdx = i
                                 mode = 2
                                 select(0, i)
                                 break
                             }
-                            if (r.contains(x, y)) {
+                            if (r.contains(tx, ty)) {
                                 dragKind = 0
                                 dragIdx = i
                                 mode = 1
@@ -338,8 +339,8 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
                         }
                     }
                     if (mode == 0) return false
-                    lastX = x
-                    lastY = y
+                    lastX = tx
+                    lastY = ty
                     parent?.requestDisallowInterceptTouchEvent(true)
                     return true
                 }
@@ -351,7 +352,7 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     if (mode != 0) {
                         mode = 0
-                        save()
+                        persist()
                     }
                     return true
                 }
@@ -359,19 +360,19 @@ class OverlayLayer(ctx: Context, private val overlay: Overlay) : FrameLayout(ctx
             return super.onTouchEvent(e)
         }
 
-        private fun drag(x: Float, y: Float) {
+        private fun drag(nx: Float, ny: Float) {
             val cw = content.width().coerceAtLeast(1f)
             val ch = content.height().coerceAtLeast(1f)
-            val dx = (x - lastX) / cw
-            val dy = (y - lastY) / ch
-            lastX = x
-            lastY = y
+            val dx = (nx - lastX) / cw
+            val dy = (ny - lastY) / ch
+            lastX = nx
+            lastY = ny
             if (dragKind == 1) {
-                val st = overlay.caption
+                val st = ov.caption
                 st.cx = (st.cx + dx).coerceIn(0.02f, 0.98f)
                 st.cy = (st.cy + dy).coerceIn(0.02f, 0.98f)
             } else {
-                val b = overlay.blurs[dragIdx]
+                val b = ov.blurs[dragIdx]
                 if (mode == 1) {
                     b.x = (b.x + dx).coerceIn(0f, 1f - b.w)
                     b.y = (b.y + dy).coerceIn(0f, 1f - b.h)
