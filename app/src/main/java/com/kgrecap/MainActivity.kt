@@ -1257,8 +1257,10 @@ Speaker rules (very important):
         } finally {
             r.release()
         }
-        layer.setVideoSize(mp.videoWidth, mp.videoHeight)
-        video.setOnPreparedListener { mp ->
+        
+        
+                video.setOnPreparedListener { mp ->
+            layer.setVideoSize(mp.videoWidth, mp.videoHeight)
             player = mp
             prepared = true
             mp.seekTo(1L, MediaPlayer.SEEK_CLOSEST)
