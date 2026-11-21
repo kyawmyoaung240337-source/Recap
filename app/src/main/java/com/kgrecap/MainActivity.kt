@@ -80,7 +80,7 @@ class MainActivity : Activity() {
     private lateinit var btnGain: Button
     private lateinit var btnSilent: Button
     private lateinit var btnExport: Button
-        private lateinit var overlay: Overlay
+    private lateinit var overlay: Overlay
     private lateinit var layer: OverlayLayer
     private lateinit var sec0: Button
     private lateinit var sec1: Button
@@ -188,7 +188,7 @@ class MainActivity : Activity() {
                 Gravity.CENTER
             )
         )
-                overlay = Overlay.load(this)
+        overlay = Overlay.load(this)
         layer = OverlayLayer(this, overlay)
         box.addView(
             layer,
@@ -283,7 +283,7 @@ class MainActivity : Activity() {
         list.adapter = adapter
         list.setOnItemClickListener { _, _, pos, _ ->
             val p = pos - list.headerViewsCount
-                        if (p in segments.indices) {
+            if (p in segments.indices) {
                 playSegment(segments[p])
                 layer.setCaptionText(trans[p] ?: "")
             }
@@ -1112,7 +1112,7 @@ Speaker rules (very important):
         }
         val vsSnapshot = videoSpeed
         val silentSnapshot = silentSpeed
-                val gainSnapshot = voiceGain
+        val gainSnapshot = voiceGain
         val overlaySnapshot = overlay.copy()
         exporting = true
         updateProgress()
@@ -1120,7 +1120,7 @@ Speaker rules (very important):
             try {
                 val savedUri = VideoExporter.export(
                     this@MainActivity, source, segSnapshot, textSnapshot, fileSnapshot,
-                                        vsSnapshot, silentSnapshot, gainSnapshot, overlaySnapshot
+                    vsSnapshot, silentSnapshot, gainSnapshot, overlaySnapshot
                 )
                 runOnUiThread {
                     exporting = false
@@ -1257,7 +1257,7 @@ Speaker rules (very important):
         } finally {
             r.release()
         }
-            layer.setVideoSize(mp.videoWidth, mp.videoHeight)
+        layer.setVideoSize(mp.videoWidth, mp.videoHeight)
         video.setOnPreparedListener { mp ->
             player = mp
             prepared = true
