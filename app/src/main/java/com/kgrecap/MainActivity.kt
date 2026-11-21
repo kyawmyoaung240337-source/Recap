@@ -760,7 +760,7 @@ Speaker rules (very important):
             Toast.makeText(this, "Copy ကူးစရာ စာမရှိသေးပါ", Toast.LENGTH_SHORT).show()
             return
         }
-        val text = buildPrompt() + "\n\n[INPUT TRANSCRIPT PARTS TO TRANSLATE]\n" +
+                val text = Prompt.TEXT + "\n" +
             parts.joinToString("\n----------------------------------------\n")
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText("kgrecap", text))
