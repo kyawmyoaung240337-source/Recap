@@ -6,6 +6,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
@@ -67,6 +68,7 @@ object VideoExporter {
     }
 
     private fun f3(v: Double) = String.format(Locale.US, "%.3f", v)
+    private fun f4(v: Float) = String.format(Locale.US, "%.4f", v)
 
     private class RenderDialog(private val act: Activity?) {
         private var dialog: AlertDialog? = null
@@ -123,7 +125,8 @@ object VideoExporter {
         ttsFiles: List<File?>,
         videoSpeed: Double,
         silentSpeed: Double,
-        gain: Double
+        gain: Double,
+        overlay: Overlay
     ): Uri {
         lastStage = "စတင်နေ"
         cancelled = false
@@ -149,8 +152,6 @@ object VideoExporter {
         val inputVideo = File(cache, "source.mp4")
         val listFile = File(cache, "scenes.txt")
         val outputVideo = File(cache, "rendered.mp4")
-        val fontDir = File(cache, "fonts").apply { mkdirs() }
-        val fontFile = File(fontDir, "NotoSansMyanmar.ttf")
         val temps = ArrayList<File>()
 
         try {
@@ -165,12 +166,8 @@ object VideoExporter {
                 FileOutputStream(inputVideo).use { output -> input.copyTo(output) }
             } ?: error("Cannot read the selected video.")
 
-            stage("2 font ကူးနေ (assets/fonts/NotoSansMyanmar.ttf)")
-            copyBundledFont(context, fontFile)
-            setFontDir(context, fontDir)
-
-            val (width, height) = videoSize(inputVideo)
-            val minDim = minOf(width, height)
+            val (fw, fh) = frameSize(inputVideo)
+            val minDim = minOf(fw, fh)
 
             val scenes = ArrayList<File>()
             for (i in 0 until total) {
@@ -191,21 +188,60 @@ object VideoExporter {
                 stage("ခန်း ${i + 1}/$total render")
                 ui.update(scenes.size, total, "ခန်း ${i + 1} render နေပါတယ်...")
 
-                val ass = File(cache, "scene_${i}.ass")
                 val scene = File(cache, "scene_${i}.mp4")
-                temps.add(ass)
                 temps.add(scene)
-                writeAssScene(ass, translations[i]?.trim().orEmpty(), dur, width, height)
 
-                val sub = subtitleFilter(ass, fontDir, minDim)
-                val vgraph = if (pre > 0.0) {
-                    "[0:v]split=2[va][vb];" +
-                        "[va]trim=start=0:end=${f3(pre)},setpts=(PTS-STARTPTS)/${f3(ss)}[p0];" +
-                        "[vb]trim=start=${f3(pre)},setpts=(PTS-STARTPTS)/${f3(p.vSpeed)}[p1];" +
-                        "[p0][p1]concat=n=2:v=1:a=0,fps=30,$sub[v]"
-                } else {
-                    "[0:v]setpts=(PTS-STARTPTS)/${f3(p.vSpeed)},fps=30,$sub[v]"
+                // စာတန်းကို Android စာလုံးဆွဲစနစ်နဲ့ PNG ဆွဲ
+                val capText = translations[i]?.trim().orEmpty()
+                var capFile: File? = null
+                if (overlay.caption.show && capText.isNotEmpty()) {
+                    val bmp = CaptionRenderer.render(context, capText, overlay.caption, fw, fh)
+                    if (bmp != null) {
+                        val f = File(cache, "cap_${i}.png")
+                        FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                        bmp.recycle()
+                        temps.add(f)
+                        capFile = f
+                    }
                 }
+
+                // ----- video graph -----
+                val vParts = ArrayList<String>()
+                if (pre > 0.0) {
+                    vParts.add("[0:v]split=2[va][vb]")
+                    vParts.add("[va]trim=start=0:end=${f3(pre)},setpts=(PTS-STARTPTS)/${f3(ss)}[p0]")
+                    vParts.add("[vb]trim=start=${f3(pre)},setpts=(PTS-STARTPTS)/${f3(p.vSpeed)}[p1]")
+                    vParts.add("[p0][p1]concat=n=2:v=1:a=0,fps=30[v0]")
+                } else {
+                    vParts.add("[0:v]setpts=(PTS-STARTPTS)/${f3(p.vSpeed)},fps=30[v0]")
+                }
+                var cur = "v0"
+                var k = 0
+                for (b in overlay.blurs) {
+                    if (!b.on) continue
+                    val x = b.x.coerceIn(0f, 0.95f)
+                    val y = b.y.coerceIn(0f, 0.95f)
+                    val w = b.w.coerceIn(0.05f, 1f - x)
+                    val h = b.h.coerceIn(0.03f, 1f - y)
+                    val sigma = (3.0 + b.density.coerceIn(0, 100) / 100.0 * 47.0) * (minDim / 720.0)
+                    vParts.add("[$cur]split=2[ba$k][bb$k]")
+                    vParts.add(
+                        "[bb$k]crop=w=trunc(iw*${f4(w)}/2)*2:h=trunc(ih*${f4(h)}/2)*2:" +
+                            "x=trunc(iw*${f4(x)}/2)*2:y=trunc(ih*${f4(y)}/2)*2,gblur=sigma=${f3(sigma)}:steps=2[bl$k]"
+                    )
+                    vParts.add("[ba$k][bl$k]overlay=x=trunc(W*${f4(x)}/2)*2:y=trunc(H*${f4(y)}/2)*2[vb$k]")
+                    cur = "vb$k"
+                    k++
+                }
+                if (capFile != null) {
+                    vParts.add(
+                        "[$cur][2:v]overlay=x='max(0,min(W-w,W*${f4(overlay.caption.cx)}-w/2))':" +
+                            "y='max(0,min(H-h,H*${f4(overlay.caption.cy)}-h/2))':format=auto:shortest=1[vout]"
+                    )
+                    cur = "vout"
+                }
+
+                // ----- audio graph -----
                 val boost = if (gain > 1.001) ",volume=${f3(gain)},alimiter=limit=0.97" else ""
                 val delayMs = (preDur * 1000.0).toInt()
                 val delay = if (delayMs > 0) ",adelay=delays=$delayMs:all=1" else ""
@@ -224,10 +260,13 @@ object VideoExporter {
                 } else {
                     args.addAll(listOf("-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono"))
                 }
+                if (capFile != null) {
+                    args.addAll(listOf("-loop", "1", "-i", capFile.absolutePath))
+                }
                 args.addAll(
                     listOf(
-                        "-filter_complex", "$vgraph;$agraph",
-                        "-map", "[v]", "-map", "[a]",
+                        "-filter_complex", (vParts + agraph).joinToString(";"),
+                        "-map", "[$cur]", "-map", "[a]",
                         "-t", f3(dur),
                         "-c:v", "mpeg4", "-q:v", "4", "-pix_fmt", "yuv420p", "-threads", "2",
                         "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "1",
@@ -273,7 +312,6 @@ object VideoExporter {
             inputVideo.delete()
             listFile.delete()
             outputVideo.delete()
-            fontFile.delete()
             temps.forEach { it.delete() }
         }
     }
@@ -322,17 +360,6 @@ object VideoExporter {
         }
     }
 
-    private fun setFontDir(context: Context, dir: File) {
-        try {
-            val c = Class.forName("com.arthenica.ffmpegkit.FFmpegKitConfig")
-            val m = c.getMethod(
-                "setFontDirectory",
-                Context::class.java, String::class.java, Map::class.java
-            )
-            m.invoke(null, context, dir.absolutePath, null)
-        } catch (e: Throwable) { }
-    }
-
     private fun runFfmpeg(st: String, args: List<String>, out: File) {
         stage(st)
         val session = FFmpegKit.executeWithArguments(args.toTypedArray())
@@ -343,75 +370,18 @@ object VideoExporter {
         }
     }
 
-    private fun videoSize(f: File): Pair<Int, Int> {
+    /** ဗီဒီယိုပုံရဲ့ အကျယ်/အမြင့် (လှည့်ထားတာကိုပါ ထည့်တွက်) */
+    private fun frameSize(f: File): Pair<Int, Int> {
         val r = MediaMetadataRetriever()
         return try {
             r.setDataSource(f.absolutePath)
             val w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 720
             val h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1280
-            w to h
+            val rot = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            if (rot == 90 || rot == 270) h to w else w to h
         } finally {
             r.release()
         }
-    }
-
-    private fun writeAssScene(target: File, caption: String, durSec: Double, width: Int, height: Int) {
-        val fontSize = (minOf(width, height) * 0.052).toInt().coerceIn(28, 68)
-        val marginV = (height * 0.045).toInt().coerceAtLeast(24)
-        val content = buildString {
-            appendLine("[Script Info]")
-            appendLine("ScriptType: v4.00+")
-            appendLine("WrapStyle: 0")
-            appendLine("ScaledBorderAndShadow: yes")
-            appendLine("PlayResX: $width")
-            appendLine("PlayResY: $height")
-            appendLine()
-            appendLine("[V4+ Styles]")
-            appendLine("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding")
-            appendLine("Style: Default,Noto Sans Myanmar,$fontSize,&H00FFFFFF,&H000000FF,&HCC000000,&H90000000,0,0,0,0,100,100,0,0,1,2.5,1,2,${(width * 0.06).toInt()},${(width * 0.06).toInt()},$marginV,1")
-            appendLine()
-            appendLine("[Events]")
-            appendLine("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
-            if (caption.isNotEmpty()) {
-                val escaped = caption
-                    .replace("\\", "\\\\")
-                    .replace("{", "\\{")
-                    .replace("}", "\\}")
-                    .replace("\r\n", "\n")
-                    .replace('\r', '\n')
-                    .replace("\n", "\\N")
-                appendLine("Dialogue: 0,${assTime(0)},${assTime(((durSec + 0.5) * 1000).toLong())},Default,,0,0,0,,$escaped")
-            }
-        }
-        target.writeText(content, Charsets.UTF_8)
-    }
-
-    private fun assTime(ms: Long): String {
-        val totalCs = (ms.coerceAtLeast(0L) + 5L) / 10L
-        val cs = totalCs % 100
-        val totalSec = totalCs / 100
-        val sec = totalSec % 60
-        val min = (totalSec / 60) % 60
-        val hour = totalSec / 3600
-        return String.format(Locale.US, "%d:%02d:%02d.%02d", hour, min, sec, cs)
-    }
-
-    private fun subtitleFilter(subtitle: File, fontDir: File, minDim: Int): String {
-        fun esc(file: File): String = file.absolutePath
-            .replace("\\", "\\\\")
-            .replace(":", "\\:")
-            .replace("'", "\\'")
-        val size = (minDim * 0.052).toInt().coerceIn(28, 68)
-        return "subtitles='${esc(subtitle)}':fontsdir='${esc(fontDir)}':force_style='FontName=Noto Sans Myanmar,FontSize=$size,Outline=2.5,Shadow=1,Alignment=2'"
-    }
-
-    private fun copyBundledFont(context: Context, target: File) {
-        val input = try {
-            context.assets.open("fonts/NotoSansMyanmar.ttf")
-        } catch (e: Exception) {
-            throw IllegalStateException("assets/fonts/NotoSansMyanmar.ttf မရှိပါ (app/src/main/assets/fonts/ ထဲ ထည့်ပါ)")
-        }
-        input.use { i -> FileOutputStream(target).use { o -> i.copyTo(o) } }
     }
 
     private fun saveToGallery(context: Context, source: File): Uri {
